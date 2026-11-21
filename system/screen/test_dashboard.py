@@ -96,7 +96,10 @@ class DashboardMathTests(unittest.TestCase):
 class DevelopmentDashboardTests(unittest.TestCase):
     def test_real_development_numbers_when_the_folder_is_present(self):
         folder = os.environ.get("SCREEN_DATA", "/tmp/grokbot-data/dev")
-        output = os.environ.get("SCREEN_OUTPUT", "/agent/repos/Cyber-hack-2026-grok/output/dev.jsonl")
+        output = os.environ.get(
+            "SCREEN_OUTPUT",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "output", "dev.jsonl")),
+        )
         if not os.path.exists(os.path.join(folder, "practice_labels.jsonl")):
             self.skipTest("development data is not on this machine")
         import json

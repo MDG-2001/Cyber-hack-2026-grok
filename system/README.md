@@ -77,7 +77,9 @@ Search and the list-type filter are on the alerts view. Open an alert to see the
 
 Record a human decision with Confirm match, Clear match, or Escalate. A rationale of 10 to 2000 characters is required. Notes are optional. Reopen adds a new line and does not delete the earlier one. The log is `system/state/analyst_log.jsonl`. That directory is gitignored. It is not `output/dev.jsonl` and `system/run` does not read it.
 
-`POST /api/analyst` rejects a bad action, a short rationale, an unknown hit, or an evidence id that is not on the case, with HTTP 400. The same idempotency key returns the original event. Sending the same action and rationale again does not add a line.
+`POST /api/analyst` and `POST /api/investigate` require `Content-Type: application/json` and the `X-Doppel-Token` header printed into the page. A present `Origin` or `Referer` must be `http://127.0.0.1:<port>` or `http://localhost:<port>`. Anything else is HTTP 403. The review server listens on `127.0.0.1` unless `HOST` or `--host` says otherwise, and it warns when that address is not loopback.
+
+`POST /api/analyst` rejects a bad action, a short rationale, an unknown hit, or an evidence id that is not on the case, with HTTP 400. The same idempotency key returns the original event. Sending the same action and rationale again does not add a line. A corrupt line in the log is left in the file and reported as unreadable. A screening request with no real name, including placeholders such as NA or TEST, is rejected before the engine runs. Request bodies larger than 64KB are refused.
 
 ## Optional model advisory
 

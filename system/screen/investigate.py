@@ -52,6 +52,9 @@ def investigate(world, hit_id: str, transport=None) -> dict:
         "deterministic": deterministic,
     }
     provider = select_provider()
+    provider_label = "the model service"
+    if provider is not None:
+        provider_label = "OpenRouter" if provider["name"] == "openrouter" else "xAI"
     if provider is None:
         base["reason"] = (
             "No API key is set. Set OPENROUTER_API_KEY or XAI_API_KEY. "
@@ -67,19 +70,19 @@ def investigate(world, hit_id: str, transport=None) -> dict:
         else:
             raw = transport(model, packet, provider["key"])
     except (TimeoutError, socket.timeout):
-        return _failure(base, "timeout", "The model request timed out. The screening decision is unchanged.")
+        return _failure(base, "timeout", provider_label + " timed out. The screening decision is unchanged.")
     except urllib.error.HTTPError as error:
         if error.code == 429:
-            return _failure(base, "rate_limited", "The model service rate-limited the request. The screening decision is unchanged.")
+            return _failure(base, "rate_limited", provider_label + " rate-limited the request. The screening decision is unchanged.")
         if 400 <= error.code < 500:
-            return _failure(base, "provider_client", f"The model service returned HTTP {error.code}. The screening decision is unchanged.")
-        return _failure(base, "provider_server", f"The model service returned HTTP {error.code}. The screening decision is unchanged.")
+            return _failure(base, "provider_client", provider_label + f" returned HTTP {error.code}. The screening decision is unchanged.")
+        return _failure(base, "provider_server", provider_label + f" returned HTTP {error.code}. The screening decision is unchanged.")
     except (urllib.error.URLError, OSError):
-        return _failure(base, "provider", "The model service could not be reached. The screening decision is unchanged.")
+        return _failure(base, "provider", provider_label + " could not be reached. The screening decision is unchanged.")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return _failure(base, "malformed", "The model did not return JSON. The screening decision is unchanged.")
+        return _failure(base, "malformed", provider_label + " did not return JSON. The screening decision is unchanged.")
     assessment = validate_assessment(parsed, allowed)
     assessment.update({
         "available": True,

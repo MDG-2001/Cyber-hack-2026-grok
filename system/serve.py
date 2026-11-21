@@ -9,9 +9,11 @@ every hit, and the records the decision cites.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,13 +23,81 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from screen.analyst_log import history as analyst_history
+from screen.analyst_log import unreadable_lines
 from screen.analyst_log import record as analyst_record
 from screen.brief import build_brief
 from screen.dashboard import name_only_decision, summarise
 from screen.engine import World
+from screen.intake import screen_name_error
 from screen.investigate import investigate
 
 PORT = 8766
+MAX_BODY = 64 * 1024
+_STATE_CHANGING = {"/api/analyst", "/api/investigate"}
+
+
+def own_origin(value, port):
+    """True when the header is absent or is this server on localhost."""
+    if not value:
+        return True
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost"):
+        return False
+    if parsed.port not in (None, port):
+        return False
+    return True
+
+
+def state_change_error(path, content_type, origin, referer, token, expected, port):
+    """403 reason for a state-changing POST, or None when the request may proceed."""
+    if path not in _STATE_CHANGING:
+        return None
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    if media != "application/json":
+        return "Content-Type must be application/json."
+    if not own_origin(origin, port) or not own_origin(referer, port):
+        return "This request was refused because its origin is not this server."
+    presented = token or ""
+    if not presented or not hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+        return "Missing or invalid X-Doppel-Token."
+    return None
+
+
+def parse_json_object(raw):
+    """Return (status, error, payload). status is None when payload is an object."""
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "Body was not JSON."}, None
+    if not isinstance(payload, dict):
+        return 400, {"error": "JSON body must be an object."}, None
+    return None, None, payload
+
+
+def bind_host(host):
+    """Return (host, warning). The warning is set when the host is not loopback."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return host, None
+    return host, "warning: listening on " + host + ", which is not only this machine"
+
+
+def serve_args(argv, environ=None):
+    """Parse [--host HOST] <data> <output>. HOST env is the default."""
+    environ = os.environ if environ is None else environ
+    host = environ.get("HOST") or "127.0.0.1"
+    args = []
+    index = 1
+    while index < len(argv):
+        if argv[index] == "--host" and index + 1 < len(argv):
+            host = argv[index + 1]
+            index += 2
+            continue
+        args.append(argv[index])
+        index += 1
+    if len(args) != 2:
+        return None
+    return host, args[0], args[1]
 
 
 def read_jsonl(path):
@@ -454,7 +524,14 @@ PAGE = """<!DOCTYPE html>
   .REVIEW .pill { background: var(--review-bg); color: var(--review); }
   .DIFFERENT_ENTITY .pill { background: var(--cleared-bg); color: var(--cleared); }
   .code { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
+  .reason, .card, .audit, .allegation, .fact-row, .contra-row, .missing-row, .source, .meta, .notice {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
   .reason { margin: 8px 0 12px; }
+  .notice { margin: 0; padding: 8px 28px; background: var(--review-bg); color: var(--review); }
+  .mini.human { background: #fff; color: var(--ink); border: 1px solid var(--ink); }
+  .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
   .evidence-label {
     font-family: ui-sans-serif, system-ui, sans-serif;
     font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
@@ -554,10 +631,11 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div class="demos" id="demos"><span class="meta">Demo picks</span></div>
 </div>
+<p id="notice" class="notice" hidden></p>
 <main id="layout">
   <aside id="browser">
     <input id="q" placeholder="Search a name, alert or hit" autocomplete="off">
-    <div class="meta filter-label">List type</div>
+    <div class="meta filter-label">List type, every list a hit is on</div>
     <div id="list-filters" class="list-filters"></div>
     <div class="nav">
       <button id="prev" type="button">Previous</button>
@@ -569,6 +647,10 @@ PAGE = """<!DOCTYPE html>
   <section id="detail"><p class="empty">Loading the development set…</p></section>
 </main>
 <script>
+const DOPPEL_TOKEN = "__DOPPEL_TOKEN__";
+function writeHeaders() {
+  return {"Content-Type": "application/json", "X-Doppel-Token": DOPPEL_TOKEN};
+}
 const LABELS = {
   DIFFERENT_ENTITY: "Cleared",
   SAME_ENTITY: "Same person",
@@ -579,6 +661,14 @@ let current = null;
 let filter = "ALL";
 let alertFilter = "ALL";
 let listFilter = "ALL";
+let listLimit = 120;
+let humanLatest = {};
+const HUMAN_LABELS = {
+  CONFIRM_MATCH: "Human: confirmed",
+  CLEAR_MATCH: "Human: cleared",
+  ESCALATE: "Human: escalated",
+  REOPEN: "Human: reopened"
+};
 let paintListFilters = () => {};
 const LIST_ORDER = ["Sanctions", "PEP", "Adverse Media", "Enforcement", "Registration", "SOE", "Other Segment"];
 
@@ -743,7 +833,16 @@ function applyLocation() {
   } else {
     setMode("alerts");
     const preset = params.get("alert");
-    const start = (preset && alerts.find(alert => alert.alert_id === preset)) || homeAlert();
+    const found = preset && alerts.find(alert => alert.alert_id === preset);
+    const notice = document.getElementById("notice");
+    if (preset && !found) {
+      notice.hidden = false;
+      notice.textContent = "Alert " + preset + " not found.";
+    } else if (notice) {
+      notice.hidden = true;
+      notice.textContent = "";
+    }
+    const start = found || homeAlert();
     if (start) show(start);
   }
   suppressHistory = false;
@@ -768,7 +867,9 @@ function show(alert) {
   const statusLabel = {CLEARED: "Cleared", ESCALATED: "Escalated to compliance", ANALYST: "Needs analyst"}[status];
   const title = el("h2", null, "");
   title.append(document.createTextNode(alert.name));
-  title.append(el("span", "pill alert-status " + (status === "CLEARED" ? "DIFFERENT_ENTITY" : status === "ESCALATED" ? "SAME_ENTITY" : "REVIEW"), statusLabel));
+  title.append(el("span", "pill alert-status " + (status === "CLEARED" ? "DIFFERENT_ENTITY" : status === "ESCALATED" ? "SAME_ENTITY" : "REVIEW"), "Engine: " + statusLabel));
+  const human = latestHuman(alert);
+  if (human) title.append(el("span", "pill mini human", HUMAN_LABELS[human.action] || human.action));
   screened.append(title);
   const bits = [alert.entity_type, alert.dob, alert.country, alert.city, alert.link].filter(Boolean);
   screened.append(el("div", "meta", bits.join(" · ") || "No screened details beyond the name"));
@@ -914,7 +1015,7 @@ function renderBrief(host, data) {
   const result = el("div");
   button.onclick = () => {
     result.replaceChildren(el("div", "meta", "Asking Grok. The screening decision will not change."));
-    fetch("/api/investigate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({hit_id: data.hit_id})})
+    fetch("/api/investigate", {method: "POST", headers: writeHeaders(), body: JSON.stringify({hit_id: data.hit_id})})
       .then(response => response.json())
       .then(payload => renderAdvisory(result, payload, data.records || []))
       .catch(() => result.replaceChildren(el("div", "cross", "The advisory request failed. The screening decision is unchanged.")));
@@ -943,8 +1044,10 @@ function renderAnalyst(host, hitId, allowedIds) {
   box.append(el("p", "meta", "This is your decision. It is stored separately and does not change the screening result."));
   const name = document.createElement("input");
   name.placeholder = "Your name";
+  name.setAttribute("aria-label", "Your name");
   name.value = localStorage.getItem("analyst-name") || "";
   const action = document.createElement("select");
+  action.setAttribute("aria-label", "Decision");
   [["CONFIRM_MATCH", "Confirm match"], ["CLEAR_MATCH", "Clear match"], ["ESCALATE", "Escalate"], ["REOPEN", "Reopen"]].forEach(pair => {
     const option = el("option", null, pair[1]);
     option.value = pair[0];
@@ -952,8 +1055,10 @@ function renderAnalyst(host, hitId, allowedIds) {
   });
   const rationale = document.createElement("textarea");
   rationale.placeholder = "Why this decision (required)";
+  rationale.setAttribute("aria-label", "Rationale");
   const notes = document.createElement("textarea");
   notes.placeholder = "Optional notes";
+  notes.setAttribute("aria-label", "Notes");
   const button = el("button", "run", "Record decision");
   button.type = "button";
   const message = el("div");
@@ -962,6 +1067,10 @@ function renderAnalyst(host, hitId, allowedIds) {
     audit.replaceChildren(el("p", "meta", "Loading the audit history…"));
     fetch("/api/analyst?hit_id=" + encodeURIComponent(hitId)).then(response => response.json()).then(payload => {
       audit.replaceChildren();
+      const unread = payload.unreadable_lines || [];
+      if (unread.length) {
+        audit.append(el("p", "cross", unread.length + " unreadable log lines preserved at line " + unread.join(", ") + "."));
+      }
       const events = payload.events || [];
       if (!events.length) {
         audit.append(el("p", "meta", "No analyst decision yet."));
@@ -987,7 +1096,7 @@ function renderAnalyst(host, hitId, allowedIds) {
     message.replaceChildren(el("p", "meta", "Saving…"));
     fetch("/api/analyst", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: writeHeaders(),
       body: JSON.stringify({
         hit_id: hitId,
         action: action.value,
@@ -1005,13 +1114,17 @@ function renderAnalyst(host, hitId, allowedIds) {
       }
       button.dataset.key = "";
       message.replaceChildren(el("p", "tick", result.payload.status === "recorded" ? "Recorded." : "Already recorded."));
-      showHistory();
+      refreshHumans().then(() => { renderList(); showHistory(); });
     }).catch(() => {
       button.dataset.pending = "0";
       message.replaceChildren(el("p", "cross", "The decision could not be saved. The screening result is unchanged."));
     });
   };
-  box.append(name, action, rationale, notes, button, message, audit);
+  const nameLabel = el("label", null, "Your name");
+  const decisionLabel = el("label", null, "Decision");
+  const rationaleLabel = el("label", null, "Rationale");
+  const notesLabel = el("label", null, "Notes");
+  box.append(nameLabel, name, decisionLabel, action, rationaleLabel, rationale, notesLabel, notes, button, message, audit);
   host.append(box);
   showHistory();
 }
@@ -1071,7 +1184,8 @@ function renderList() {
     list.append(el("p", "empty", "Nothing matches that search."));
     return;
   }
-  for (const alert of rows.slice(0, 120)) {
+  const shown = rows.slice(0, listLimit);
+  for (const alert of shown) {
     const btn = el("button", "alert-btn" + (alert.alert_id === current ? " active" : ""));
     btn.dataset.id = alert.alert_id;
     const text = el("div");
@@ -1083,10 +1197,50 @@ function renderList() {
     if (names.length) text.append(listBadges(names));
     btn.append(text);
     const kind = headline(alert);
-    btn.append(el("span", "mini " + kind, LABELS[kind]));
-    btn.onclick = () => show(alert);
+    const marks = el("div");
+    marks.append(el("span", "mini " + kind, LABELS[kind]));
+    const human = latestHuman(alert);
+    if (human) marks.append(el("span", "mini human", HUMAN_LABELS[human.action] || human.action));
+    btn.append(marks);
+    btn.onclick = () => { clearNotice(); show(alert); };
     list.append(btn);
   }
+  if (rows.length > shown.length) {
+    list.append(el("p", "meta", "Showing " + shown.length + " of " + rows.length));
+    const more = el("button", null, "Show more");
+    more.type = "button";
+    more.onclick = () => { listLimit += 120; renderList(); };
+    list.append(more);
+  }
+}
+
+function clearNotice() {
+  const notice = document.getElementById("notice");
+  if (!notice) return;
+  notice.hidden = true;
+  notice.textContent = "";
+}
+
+function refreshHumans() {
+  return fetch("/api/analyst").then(response => response.json()).then(data => {
+    humanLatest = {};
+    (data.events || []).forEach(event => { humanLatest[event.hit_id] = event; });
+    const unread = data.unreadable_lines || [];
+    const notice = document.getElementById("notice");
+    if (unread.length && notice && notice.hidden) {
+      notice.hidden = false;
+      notice.textContent = unread.length + " unreadable log lines preserved at line " + unread.join(", ") + ".";
+    }
+  }).catch(() => {});
+}
+
+function latestHuman(alert) {
+  let found = null;
+  (alert.hits || []).forEach(hit => {
+    const event = humanLatest[hit.hit_id];
+    if (event && (!found || event.at > found.at)) found = event;
+  });
+  return found;
 }
 
 function renderPicture(host, data) {
@@ -1208,7 +1362,8 @@ function loadDashboard() {
     if (!timing.measured) root.append(el("p", "missing-row", "This process has not measured a run."));
     else root.append(el("p", null, timing.elapsed_ms + " ms for " + report.hits.processed + " hits (" + timing.ms_per_hit + " ms per hit). Measured " + timing.measured_at + "."));
     root.append(el("p", "meta", timing.what || ""));
-    root.append(el("h3", null, "Hits by list type"));
+    root.append(el("h3", null, "Hits by primary list only"));
+    const wrap = el("div", "table-scroll");
     const table = document.createElement("table");
     table.className = "score";
     const header = document.createElement("tr");
@@ -1220,7 +1375,8 @@ function loadDashboard() {
       tr.append(el("td", null, String(row.hits)));
       table.append(tr);
     });
-    root.append(table);
+    wrap.append(table);
+    root.append(wrap);
     root.append(el("h3", null, "Reason codes"));
     ["clearing", "confirming", "review"].forEach(name => {
       const line = ((report.reason_codes || {})[name] || []).map(item => item.reason_code + " " + item.hits).join(" · ");
@@ -1273,7 +1429,9 @@ function loadAnswers(live) {
       tr.append(el("td", row.match ? "tick" : "cross", row.match ? "Match" : (row.unsafe ? "Unsafe clear" : "Miss")));
       table.append(tr);
     });
-    root.append(table);
+    const wrap = el("div", "table-scroll");
+    wrap.append(table);
+    root.append(wrap);
   }).catch(() => root.replaceChildren(el("p", "cross", "Could not score the practice labels.")));
 }
 
@@ -1361,11 +1519,23 @@ function showScreen() {
     event.preventDefault();
     const body = {};
     new FormData(form).forEach((value, key) => { body[key] = value; });
+    const screenName = String(body.customer_name || "").trim();
+    const screenToken = screenName.toLowerCase();
+    if (!screenName || ["na", "n/a", "test", "unknown", "xxx", "none", "null", "nil"].indexOf(screenToken) >= 0 || /^[0-9]+$/.test(screenToken)) {
+      host.replaceChildren(el("div", "cross", "A real customer name is required. Placeholders such as NA, TEST and UNKNOWN are not a name."));
+      return;
+    }
     host.replaceChildren(el("div", "meta", "Searching every watchlist profile…"));
     fetch("/api/screen", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
-      .then(response => response.json())
-      .then(payload => showScreenResult(host, payload))
-      .catch(() => host.replaceChildren(el("div", "cross", "Screening failed.")));
+      .then(response => response.json().then(payload => ({ok: response.ok, payload})))
+      .then(result => {
+        if (!result.ok) {
+          host.replaceChildren(el("div", "cross", (result.payload && result.payload.error) || "Screening was rejected."));
+          return;
+        }
+        showScreenResult(host, result.payload);
+      })
+      .catch(() => host.replaceChildren(el("div", "cross", "Screening failed. The server did not answer.")));
   };
   root.append(form, host);
 }
@@ -1420,7 +1590,8 @@ function showTry() {
     host.replaceChildren(el("div", "meta", "Running…"));
     fetch("/api/try", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
       .then(response => response.json())
-      .then(payload => renderSteps(host, payload));
+      .then(payload => renderSteps(host, payload))
+      .catch(() => host.replaceChildren(el("div", "cross", "The decision could not be run. The server did not answer.")));
   };
   root.append(form, host);
 }
@@ -1436,6 +1607,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
     button.append(el("b", null, String(number)));
     button.append(document.createTextNode(label));
     button.onclick = () => {
+      listLimit = 120;
       filter = filter === key ? "ALL" : key;
       counts.querySelectorAll(".count").forEach(node => node.classList.remove("active"));
       if (filter !== "ALL") button.classList.add("active");
@@ -1464,6 +1636,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
     node.append(el("strong", null, String(number)));
     node.append(document.createTextNode(label));
     node.onclick = () => {
+      listLimit = 120;
       alertFilter = alertFilter === key ? "ALL" : key;
       workload.querySelectorAll(".count").forEach(item => item.classList.remove("active"));
       if (alertFilter !== "ALL") node.classList.add("active");
@@ -1518,7 +1691,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
     });
   };
   paintListFilters();
-  document.getElementById("q").addEventListener("input", renderList);
+  document.getElementById("q").addEventListener("input", () => { listLimit = 120; renderList(); });
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
   document.getElementById("mode-dashboard").onclick = () => setMode("dashboard");
@@ -1547,7 +1720,9 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
     goHome(false);
   });
   window.addEventListener("popstate", () => applyLocation());
-  applyLocation();
+  refreshHumans().then(() => applyLocation());
+}).catch(() => {
+  document.getElementById("detail").replaceChildren(el("p", "cross", "The development set could not be loaded. The server did not answer."));
 });
 </script>
 </body>
@@ -1563,6 +1738,40 @@ class Handler(BaseHTTPRequestHandler):
     analyst_path = ""
     measured_ms = None
     measured_at = None
+    csrf_token = ""
+    port = PORT
+
+    def _read_json(self):
+        header = self.headers.get("Content-Length")
+        if header is None or header == "":
+            length = 0
+        else:
+            try:
+                length = int(header)
+            except ValueError:
+                return 400, {"error": "Content-Length was not a number."}, None
+        if length < 0:
+            return 400, {"error": "Content-Length was not a number."}, None
+        if length > MAX_BODY:
+            self.close_connection = True
+            return 413, {"error": "Request body is larger than 64KB."}, None
+        raw = self.rfile.read(length) if length else b"{}"
+        return parse_json_object(raw)
+
+    def _forbid(self, path):
+        message = state_change_error(
+            path,
+            self.headers.get("Content-Type"),
+            self.headers.get("Origin"),
+            self.headers.get("Referer"),
+            self.headers.get("X-Doppel-Token"),
+            self.csrf_token,
+            self.port,
+        )
+        if message:
+            self._json({"error": message}, 403)
+            return True
+        return False
 
     def _dashboard(self):
         label_ids = {row["hit_id"] for row in self.labels}
@@ -1646,10 +1855,13 @@ class Handler(BaseHTTPRequestHandler):
             if hit_id and hit_id not in self.world.hits:
                 self._json({"error": "Unknown hit."}, 404)
                 return
-            self._json({"events": analyst_history(self.analyst_path, hit_id)})
+            self._json({
+                "events": analyst_history(self.analyst_path, hit_id),
+                "unreadable_lines": unreadable_lines(self.analyst_path),
+            })
             return
         if parsed.path in ("/", "/index.html"):
-            body = PAGE.encode("utf-8")
+            body = PAGE.replace("__DOPPEL_TOKEN__", self.csrf_token).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1660,17 +1872,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
-        try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            self._json({"error": "Body was not JSON"}, 400)
+        status, error, payload = self._read_json()
+        if error:
+            self._json(error, status)
+            return
+        if self._forbid(parsed.path):
             return
         if parsed.path == "/api/try":
             self._json(self._trace(self.world.explain_entered(payload)))
             return
         if parsed.path == "/api/screen":
+            message = screen_name_error(payload.get("customer_name") or payload.get("name"))
+            if message:
+                self._json({"error": message}, 400)
+                return
             result = self.world.screen_customer(payload)
             for candidate in result.get("candidates") or []:
                 hit = self.world.hits.get(candidate.get("hit_id")) or {}
@@ -1699,9 +1914,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(body, status)
             return
         if parsed.path == "/api/investigate":
-            if length > 10000:
-                self._json({"available": False, "live": False, "source": "error", "error": "too_large", "overrides_decision": False, "reason": "The request was too large. The screening decision is unchanged."}, 413)
-                return
             hit_id = str(payload.get("hit_id") or "")
             self._json(investigate(self.world, hit_id))
             return
@@ -1726,10 +1938,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: python3 system/serve.py <data folder> <output file>", file=sys.stderr)
+    parsed = serve_args(sys.argv)
+    if parsed is None:
+        print("usage: python3 system/serve.py [--host HOST] <data folder> <output file>", file=sys.stderr)
         sys.exit(2)
-    folder, output = sys.argv[1], sys.argv[2]
+    host, folder, output = parsed
+    host, warning = bind_host(host)
+    if warning:
+        print(warning, file=sys.stderr)
     Handler.bundle = load_bundle(folder, output)
     Handler.saved = {row["hit_id"]: row for row in read_jsonl(output)}
     practice_path = os.path.join(folder, "practice_labels.jsonl")
@@ -1738,11 +1954,13 @@ def main():
     Handler.world = World(folder)
     Handler.bundle["screen_examples"] = Handler.world.suggest_screen_examples()
     Handler.analyst_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "analyst_log.jsonl")
+    Handler.csrf_token = secrets.token_urlsafe(32)
+    Handler.port = PORT
     started = time.perf_counter()
     Handler.world.decide_all()
     Handler.measured_ms = (time.perf_counter() - started) * 1000.0
     Handler.measured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer((host, PORT), Handler)
     print(f"Demo at http://127.0.0.1:{PORT}  ({Handler.bundle['hits']} hits)")
     server.serve_forever()
 
