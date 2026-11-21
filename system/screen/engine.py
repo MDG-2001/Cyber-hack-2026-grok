@@ -44,18 +44,51 @@ MONTH = (
     "September|October|November|December"
 )
 _DATED_REPORT = re.compile(rf"According to [^;\n]+;\s*((?:{MONTH}) \d{{1,2}}, \d{{4}}):")
-_AGE_PATTERNS = [
+# Explicit ages only. A bare "was N" or a comma-number is not an age by itself.
+_EXPLICIT_AGE = [
     re.compile(r"\b(\d{1,3})\s*-\s*year\s*-\s*old\b", re.I),
     re.compile(r"\b(\d{1,3})\s+years?\s+old\b", re.I),
     re.compile(r"\bat the age of\s+(\d{1,3})\b", re.I),
     re.compile(r"\breached the age of\s+(\d{1,3})\b", re.I),
-    re.compile(r"\bthe age of\b[^.]{0,60}?\bwas\s+(\d{1,3})\b", re.I),
+    re.compile(r"\bthe age of\b[^.]{0,40}?\bwas\s+(\d{1,3})\b", re.I),
     re.compile(r"\baged\s+(\d{1,3})\b", re.I),
     re.compile(r"\bat age\s+(\d{1,3})\b", re.I),
-    re.compile(r"\bwas\s+(\d{1,3})\b", re.I),
-    re.compile(r",\s*(\d{1,3})\s*,"),
+    # "he was 46" / "who was 24". Not "was 100 percent" or "was 2 days".
+    re.compile(
+        r"\b(?:who|he|she|they)\s+was\s+(\d{1,3})\b"
+        r"(?!\s*(?:percent|per\s+cent|days?|months?|weeks?|people|persons|companies|times)\b)",
+        re.I,
+    ),
+    # "Frank Murud was 48 when ..." / "was 31 at the time". The number has to
+    # be tied to the event with "when" or "at the time", not a bare "was N".
+    re.compile(r"\bwas\s+(\d{1,3})\s+when\b", re.I),
+    re.compile(r"\bwas\s+(\d{1,3})\s+at the time\b", re.I),
 ]
+# "Tomasz Drozd was 27." Only used when the sentence names one person and one event.
+_BARE_WAS_AGE = re.compile(
+    r"\bwas\s+(\d{1,3})\b(?!\s*(?:percent|per\s+cent|days?|months?|weeks?|people|persons|companies|times|pages?)\b)",
+    re.I,
+)
+_NOT_A_PERSON = {
+    "During", "On", "In", "The", "After", "Before", "From", "Under", "Over",
+    "According", "Local", "Public", "Specially", "Executive", "Office",
+}
+_COMMA_AGE = re.compile(r",\s*(\d{1,3})\s*,")
 _YEAR_IN_TEXT = re.compile(rf"\b(?:{MONTH})\s+(?:\d{{1,2}},?\s+)?(\d{{4}})\b", re.I)
+_PERSON_NAME = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
+# Highest priority first. Matches the order judge() uses.
+_CODE_PRIORITY = (
+    "ENTITY_TYPE_MISMATCH",
+    "DECEASED",
+    "TEMPORAL_IMPOSSIBILITY",
+    "DOB_MISMATCH",
+    "NAME_MISMATCH_VERIFIED",
+    "LOCATION_MISMATCH",
+    "NAME_DOB_LOCATION_MATCH",
+    "NAME_DOB_MATCH",
+    "NAME_LOCATION_MATCH",
+    "INSUFFICIENT_DATA",
+)
 
 PHRASES = {
     "sanctions": "a sanctioned individual",
@@ -129,25 +162,203 @@ def explicit_births(text: str) -> list[When]:
     return found
 
 
+def _sentences(text: str) -> list[str]:
+    """Split on sentence ends. An age in one sentence is not paired with a date in another."""
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text or "")
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _event_years(sentence: str) -> list[tuple[int, int, int]]:
+    """Month-years that are events, not 'born in March 1990'."""
+    found = []
+    for match in _YEAR_IN_TEXT.finditer(sentence):
+        prefix = sentence[max(0, match.start() - 16) : match.start()].lower()
+        if re.search(r"\bborn\s+(?:on\s+|in\s+)?$", prefix):
+            continue
+        year = int(match.group(1))
+        if 1850 <= year <= 2100:
+            found.append((match.start(), match.end(), year))
+    return found
+
+
+def _plausible_age(value: int) -> bool:
+    return 1 <= value <= 110
+
+
+def _explicit_ages(sentence: str) -> list[tuple[int, int, int]]:
+    found = []
+    for pattern in _EXPLICIT_AGE:
+        for match in pattern.finditer(sentence):
+            age = int(match.group(1))
+            if _plausible_age(age):
+                found.append((match.start(), match.end(), age))
+    return found
+
+
+def _comma_ages(sentence: str) -> list[tuple[int, int, int]]:
+    found = []
+    for match in _COMMA_AGE.finditer(sentence):
+        age = int(match.group(1))
+        if _plausible_age(age):
+            found.append((match.start(), match.end(), age))
+    return found
+
+
+def _other_people(span: str, subject: str | None) -> list[str]:
+    """Capitalised full names in a span, ignoring country names and the aged subject."""
+    people = []
+    subject_key = (subject or "").casefold()
+    for match in _PERSON_NAME.finditer(span):
+        if match.start() > 0 and span[match.start() - 1] == "-":
+            continue
+        name = match.group(1)
+        if subject_key and name.casefold() == subject_key:
+            continue
+        if name.split()[0] in _NOT_A_PERSON:
+            continue
+        if canon(name) or canon(" ".join(name.split()[:2])):
+            continue
+        people.append(name)
+    return people
+
+
+def _directly_related(gap: str, subject: str | None) -> bool:
+    """True when nothing but the subject's name sits between the age and the year."""
+    if "," not in gap:
+        return True
+    words = [word for word in re.split(r"[\s,]+", gap) if word]
+    return bool(subject) and words == subject.split()
+
+
+def _subject_before(sentence: str, age_start: int) -> str | None:
+    prefix = sentence[:age_start].rstrip(" ,")
+    match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*$", prefix)
+    if match and not canon(match.group(1)):
+        return match.group(1)
+    return None
+
+
+def _year_pair(event_year: int, age: int, origin: str, confident: bool) -> When:
+    # Someone aged 45 in March 2019 was born in 1973 or 1974.
+    return When(years=(event_year - age - 1, event_year - age), origin=origin, confident=confident)
+
+
+def _age_in_sentence(sentence: str, origin: str) -> list[When]:
+    years = _event_years(sentence)
+    if not years:
+        return []
+    if len({item[2] for item in years}) > 1:
+        # Two event years in one sentence. Do not guess which one the age belongs to.
+        return []
+    explicit = _explicit_ages(sentence)
+    if not explicit and len(_other_people(sentence, None)) == 1 and len({item[2] for item in years}) == 1:
+        bare = []
+        for match in _BARE_WAS_AGE.finditer(sentence):
+            age = int(match.group(1))
+            if _plausible_age(age):
+                bare.append((match.start(), match.end(), age))
+        if len({item[2] for item in bare}) == 1:
+            explicit = bare[:1]
+    if explicit:
+        if len({item[2] for item in explicit}) > 1:
+            return []
+        age = explicit[0]
+        year = years[0]
+        # Two named people in one sentence: the age may belong to either of them.
+        if len(_other_people(sentence, None)) > 1:
+            return []
+        return [_year_pair(year[2], age[2], origin, True)]
+    commas = _comma_ages(sentence)
+    if not commas:
+        return []
+    if len({item[2] for item in commas}) > 1:
+        # Two different comma-ages means two people. Neither age is safe to use.
+        return []
+    age = commas[0]
+    year = years[0]
+    gap = sentence[min(age[1], year[1]) : max(age[0], year[0])]
+    subject = _subject_before(sentence, age[0])
+    if _other_people(gap, subject):
+        return []
+    # Another clause between the age and the year. The number may still be
+    # this person's age, but it is not strong enough to clear on by itself.
+    confident = _directly_related(gap, subject)
+    return [_year_pair(year[2], age[2], origin, confident)]
+
+
 def age_births(text: str, origin: str) -> list[When]:
-    """An age at a dated event is two possible birth years, one year apart."""
+    """Birth years implied by an age at a dated event, one sentence at a time.
+
+    The age and the event year have to be about the same person in the same
+    sentence. A loose comma-age is returned with confident=False: it may
+    support a match, and it must not be the only reason to clear.
+    """
     if not text:
         return []
-    year_match = _YEAR_IN_TEXT.search(text)
-    if not year_match:
+    found = []
+    seen = set()
+    for sentence in _sentences(text):
+        for item in _age_in_sentence(sentence, origin):
+            key = (item.years, item.confident)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(item)
+    ranges = {item.years for item in found}
+    if len(ranges) > 1:
+        # The text gives conflicting ages. Neither one is reliable.
         return []
-    event_year = int(year_match.group(1))
-    for pattern in _AGE_PATTERNS:
-        age_match = pattern.search(text)
-        if not age_match:
-            continue
-        age = int(age_match.group(1))
-        if not 1 <= age <= 110:
-            continue
-        lo = event_year - age - 1
-        hi = event_year - age
-        return [When(years=(lo, hi), origin=origin)]
-    return []
+    return found
+
+
+def resolve_dob(customer: When | None, births: list[When]) -> tuple[bool, bool]:
+    """(agrees, mismatch). A low-confidence age can agree. It cannot be the only mismatch."""
+    confident = [item for item in births if item.confident]
+    uncertain = [item for item in births if not item.confident]
+    agrees_confident, mismatch_confident = compare_births(customer, confident)
+    agrees_uncertain, _ignored = compare_births(customer, uncertain)
+    agrees = agrees_confident or agrees_uncertain
+    mismatch = bool(mismatch_confident and not agrees)
+    return agrees, mismatch
+
+
+def applicable_codes(compared: dict) -> set[str]:
+    """Every reason code this one comparison actually supports."""
+    codes = set()
+    if compared["type_mismatch"]:
+        codes.add("ENTITY_TYPE_MISMATCH")
+    if compared["deceased"]:
+        codes.add("DECEASED")
+    if compared["temporal"]:
+        codes.add("TEMPORAL_IMPOSSIBILITY")
+    if compared["dob_mismatch"]:
+        codes.add("DOB_MISMATCH")
+    if compared["name_mismatch"]:
+        codes.add("NAME_MISMATCH_VERIFIED")
+    if compared["location_clears"]:
+        codes.add("LOCATION_MISMATCH")
+    person = compared["customer_kind"] == "person"
+    company = compared["customer_kind"] == "company"
+    if person and compared["name_agrees"] and compared["dob_agrees"] and not compared["location_mismatch"]:
+        codes.add("NAME_DOB_MATCH")
+        if compared["location_agree"]:
+            codes.add("NAME_DOB_LOCATION_MATCH")
+    if company and compared["name_agrees"] and compared["location_agree"]:
+        codes.add("NAME_LOCATION_MATCH")
+    if not codes:
+        codes.add("INSUFFICIENT_DATA")
+    return codes
+
+
+def shared_reason_code(per_party: list[set[str]]) -> str | None:
+    """A code that is true for every customer, preferring the same order as judge()."""
+    if not per_party:
+        return None
+    common = set.intersection(*per_party)
+    for code in _CODE_PRIORITY:
+        if code in common:
+            return code
+    return None
 
 
 def dated_reports(text: str) -> list[When]:
@@ -638,7 +849,7 @@ class World:
                     break
         name_mismatch = bool(party.verified_name and usable and not name_agrees and customer_tokens)
 
-        dob_agrees, dob_mismatch = compare_births(party.dob, facts.births)
+        dob_agrees, dob_mismatch = resolve_dob(party.dob, facts.births)
 
         overlap = party.countries & facts.countries
         location_agree = bool(overlap)
@@ -1571,6 +1782,65 @@ class World:
                     wanted["NEEDS_ANALYST"] = payload
         return [item for item in (wanted["ESCALATE"], wanted["PASS"], wanted["NEEDS_ANALYST"]) if item]
 
+    def _shared_reason(self, code: str, parties: list, compared: list) -> str:
+        """A reason that is true of every customer, not only the first one."""
+        facts = compared[0]["facts"]
+        hit_name = compared[0]["hit_name"]
+        if code == "LOCATION_MISMATCH":
+            hit_where = joined(facts.countries)
+            same_countries = len({tuple(sorted(party.countries)) for party in parties}) == 1
+            ids = " and ".join(party.seed_id for party in parties)
+            if same_countries:
+                return (
+                    f"{ids} are linked only to {joined(parties[0].countries)} "
+                    f"but the hit is linked only to {hit_where}."
+                )
+            detail = "; ".join(
+                f"{party.seed_id} is linked only to {joined(party.countries)}" for party in parties
+            )
+            return (
+                f"{detail}. None of those countries are on the hit, "
+                f"which is linked only to {hit_where}."
+            )
+        if code == "DOB_MISMATCH":
+            births = self._hit_birth_clause(facts)
+            pieces = [
+                f"{party.seed_id} was born {party.dob.label()} ({party.dob_source_id})"
+                for party in parties
+                if party.dob is not None
+            ]
+            return f"{'; '.join(pieces)}, but {births}."
+        if code == "NAME_MISMATCH_VERIFIED":
+            pieces = []
+            for party in parties:
+                if not party.verified_name:
+                    continue
+                source = party.identity.source_id if party.identity else party.seed_id
+                display = party.identity.name if party.identity and party.identity.name else party.seed_id
+                pieces.append(f"{display} ({source})")
+            return (
+                f"The verified names {', '.join(pieces)} do not match the hit's name {hit_name}."
+            )
+        if code == "ENTITY_TYPE_MISMATCH":
+            return (
+                f"Every matching customer is a {compared[0]['customer_kind']} and the hit is a "
+                f"{compared[0]['hit_kind']}, so they cannot be the same entity."
+            )
+        if code == "DECEASED" and facts.death:
+            return (
+                f"The hit's profile gives a date of death of {facts.death.label()}, "
+                f"which is before every matching customer was screened."
+            )
+        if code == "TEMPORAL_IMPOSSIBILITY":
+            ids = " and ".join(party.seed_id for party in parties)
+            return (
+                f"{ids} could not have been the listed person at the earliest date in the hit's profile."
+            )
+        ids = " and ".join(party.seed_id for party in parties)
+        return (
+            f"{ids} lead to the same decision ({code.replace('_', ' ').lower()})."
+        )
+
     def decide_hit(self, alert: dict, hit: dict) -> Outcome:
         parties = self.resolve(alert)
         if not parties:
@@ -1595,10 +1865,21 @@ class World:
         record_ids = ", ".join(party.seed_id for party in parties)
         if len(decisions) == 1:
             chosen = outcomes[0]
+            compared = [self._compare(alert, hit, party) for party in parties]
+            shared = shared_reason_code([applicable_codes(item) for item in compared])
+            # Keep the decision they share. Only replace the code when the first
+            # customer's code is not true of every customer.
+            code = shared or chosen.reason_code
+            reason = chosen.reason
+            countries_differ = len({tuple(sorted(party.countries)) for party in parties}) > 1
+            # The first customer's wording is wrong when their code is not everyone's,
+            # or when a shared location clearance hides different country sets.
+            if code != chosen.reason_code or (code == "LOCATION_MISMATCH" and countries_differ):
+                reason = self._shared_reason(code, parties, compared)
             return Outcome(
                 decision=chosen.decision,
-                reason_code=chosen.reason_code,
-                reason=chosen.reason,
+                reason_code=code,
+                reason=reason,
                 evidence=sorted(evidence, key=_evidence_key),
                 customer_record_id="AMBIGUOUS",
             )

@@ -35,6 +35,10 @@ class When:
     month: int | None = None
     day: int | None = None
     origin: str = "listed"  # listed, notes, search, customer
+    # False when the year was inferred from a loose age (a comma-number
+    # separated from its date by another clause). Those years may support a
+    # match. They are not, on their own, a contradiction.
+    confident: bool = True
 
     @property
     def year(self) -> int:
