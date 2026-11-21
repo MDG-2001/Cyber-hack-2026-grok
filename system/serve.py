@@ -13,12 +13,17 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from screen.analyst_log import history as analyst_history
+from screen.analyst_log import record as analyst_record
 from screen.brief import build_brief
+from screen.dashboard import name_only_decision, summarise
 from screen.engine import World
 from screen.investigate import investigate
 
@@ -513,6 +518,12 @@ PAGE = """<!DOCTYPE html>
   form.try input, form.try select { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: 15px ui-sans-serif, system-ui, sans-serif; }
   main.single { grid-template-columns: 1fr; }
   @keyframes rise { to { opacity: 1; transform: none; } }
+  .dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 8px 0 14px; }
+  .dash .count { cursor: default; }
+  .analyst { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .analyst textarea { min-height: 72px; }
+  .audit { margin: 8px 0; }
+  .audit .card { margin-top: 6px; }
   @media (max-width: 800px) {
     main { grid-template-columns: 1fr; }
     aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -536,6 +547,7 @@ PAGE = """<!DOCTYPE html>
 <div class="toolbar">
   <div class="modes">
     <button type="button" id="mode-screen">Screen a new customer</button>
+    <button type="button" id="mode-dashboard">Dashboard</button>
     <button type="button" id="mode-alerts" class="active">Alerts</button>
     <button type="button" id="mode-answers">Test against answers</button>
     <button type="button" id="mode-try">Try your own</button>
@@ -726,7 +738,7 @@ function applyLocation() {
   if (allChip) allChip.classList.add("active");
   suppressHistory = true;
   const view = params.get("view");
-  if (view === "screen" || view === "answers" || view === "try") {
+  if (view === "screen" || view === "answers" || view === "try" || view === "dashboard") {
     setMode(view);
   } else {
     setMode("alerts");
@@ -879,6 +891,7 @@ function renderBrief(host, data) {
     host.append(el("h3", null, "Why a person still has to look"));
     data.review_reasons.forEach(line => host.append(el("div", "missing-row", line)));
   }
+  renderAnalyst(host, data.hit_id, (data.records || []).map(record => record.id));
   host.append(el("h3", null, "Original records"));
   (data.records || []).forEach(record => {
     const box = el("div", "card");
@@ -895,7 +908,7 @@ function renderBrief(host, data) {
   });
   const advisory = el("div", "advisory");
   advisory.append(el("h3", null, "Grok advisory"));
-  advisory.append(el("p", "meta", "This is an advisory. It does not change the screening decision. A live answer is labelled Grok. If the key is missing, nothing is invented."));
+  advisory.append(el("p", "meta", "This is an advisory. It does not change the screening decision. A live answer names its provider. If no key is set, nothing is invented."));
   const button = el("button", "run", "Request advisory");
   button.type = "button";
   const result = el("div");
@@ -903,7 +916,7 @@ function renderBrief(host, data) {
     result.replaceChildren(el("div", "meta", "Asking Grok. The screening decision will not change."));
     fetch("/api/investigate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({hit_id: data.hit_id})})
       .then(response => response.json())
-      .then(payload => renderAdvisory(result, payload))
+      .then(payload => renderAdvisory(result, payload, data.records || []))
       .catch(() => result.replaceChildren(el("div", "cross", "The advisory request failed. The screening decision is unchanged.")));
   };
   advisory.append(button, result);
@@ -924,7 +937,86 @@ function renderClaims(host, claims, className, empty) {
   });
 }
 
-function renderAdvisory(host, payload) {
+function renderAnalyst(host, hitId, allowedIds) {
+  const box = el("div", "analyst");
+  box.append(el("h3", null, "Analyst decision"));
+  box.append(el("p", "meta", "This is your decision. It is stored separately and does not change the screening result."));
+  const name = document.createElement("input");
+  name.placeholder = "Your name";
+  name.value = localStorage.getItem("analyst-name") || "";
+  const action = document.createElement("select");
+  [["CONFIRM_MATCH", "Confirm match"], ["CLEAR_MATCH", "Clear match"], ["ESCALATE", "Escalate"], ["REOPEN", "Reopen"]].forEach(pair => {
+    const option = el("option", null, pair[1]);
+    option.value = pair[0];
+    action.append(option);
+  });
+  const rationale = document.createElement("textarea");
+  rationale.placeholder = "Why this decision (required)";
+  const notes = document.createElement("textarea");
+  notes.placeholder = "Optional notes";
+  const button = el("button", "run", "Record decision");
+  button.type = "button";
+  const message = el("div");
+  const audit = el("div", "audit");
+  function showHistory() {
+    audit.replaceChildren(el("p", "meta", "Loading the audit history…"));
+    fetch("/api/analyst?hit_id=" + encodeURIComponent(hitId)).then(response => response.json()).then(payload => {
+      audit.replaceChildren();
+      const events = payload.events || [];
+      if (!events.length) {
+        audit.append(el("p", "meta", "No analyst decision yet."));
+        return;
+      }
+      events.forEach(event => {
+        const card = el("div", "card");
+        card.append(el("div", "kind", event.at + " · " + event.analyst));
+        card.append(el("div", null, event.action + (event.previous_action ? " (was " + event.previous_action + ")" : "")));
+        card.append(el("div", null, event.rationale));
+        if (event.notes) card.append(el("div", "meta", event.notes));
+        if ((event.cited_ids || []).length) card.append(el("div", "meta", "Cited " + event.cited_ids.join(", ")));
+        audit.append(card);
+      });
+    }).catch(() => audit.replaceChildren(el("p", "cross", "The audit history could not be loaded.")));
+  }
+  button.onclick = () => {
+    if (button.dataset.pending === "1") return;
+    button.dataset.pending = "1";
+    const key = button.dataset.key || (hitId + "-" + Date.now());
+    button.dataset.key = key;
+    localStorage.setItem("analyst-name", name.value);
+    message.replaceChildren(el("p", "meta", "Saving…"));
+    fetch("/api/analyst", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        hit_id: hitId,
+        action: action.value,
+        rationale: rationale.value,
+        notes: notes.value,
+        analyst: name.value,
+        idempotency_key: key,
+        cited_ids: allowedIds
+      })
+    }).then(response => response.json().then(payload => ({ok: response.ok, status: response.status, payload}))).then(result => {
+      button.dataset.pending = "0";
+      if (!result.ok) {
+        message.replaceChildren(el("p", "cross", (result.payload && result.payload.error) || ("The decision was rejected (" + result.status + ").")));
+        return;
+      }
+      button.dataset.key = "";
+      message.replaceChildren(el("p", "tick", result.payload.status === "recorded" ? "Recorded." : "Already recorded."));
+      showHistory();
+    }).catch(() => {
+      button.dataset.pending = "0";
+      message.replaceChildren(el("p", "cross", "The decision could not be saved. The screening result is unchanged."));
+    });
+  };
+  box.append(name, action, rationale, notes, button, message, audit);
+  host.append(box);
+  showHistory();
+}
+
+function renderAdvisory(host, payload, records) {
   host.replaceChildren();
   if (!payload) return;
   if (!payload.live) {
@@ -938,8 +1030,8 @@ function renderAdvisory(host, payload) {
   banner.append(document.createTextNode((payload.assessment || "UNCERTAIN") + " · model " + (payload.model || "")));
   host.append(banner);
   host.append(el("p", "meta", "Advisory only. The screening decision stays " + ((payload.deterministic || {}).decision || "as saved") + "."));
-  (payload.supports || []).forEach(claim => host.append(advisoryClaim(claim, "fact-row")));
-  (payload.contradicts || []).forEach(claim => host.append(advisoryClaim(claim, "contra-row")));
+  (payload.supports || []).forEach(claim => host.append(advisoryClaim(claim, "fact-row", records)));
+  (payload.contradicts || []).forEach(claim => host.append(advisoryClaim(claim, "contra-row", records)));
   (payload.missing || []).forEach(line => host.append(el("div", "missing-row", line)));
   (payload.next_checks || []).forEach(line => host.append(el("div", "meta", "Check next: " + line)));
   (payload.uncertain || []).forEach(line => {
@@ -950,12 +1042,22 @@ function renderAdvisory(host, payload) {
   });
 }
 
-function advisoryClaim(claim, className) {
+function advisoryClaim(claim, className, records) {
   const row = el("div", className);
   const unsupported = claim.kind === "unsupported" || !(claim.evidence_ids || []).length;
   row.append(el("span", "tag " + (unsupported ? "unsupported" : "interpretation"), unsupported ? "Unsupported" : "Model reading"));
   row.append(document.createTextNode(claim.statement || ""));
-  if ((claim.evidence_ids || []).length) row.append(el("div", "meta", claim.evidence_ids.join(", ")));
+  (claim.evidence_ids || []).forEach(id => {
+    const record = (records || []).find(item => item.id === id);
+    const button = el("button", "record-link", id);
+    button.type = "button";
+    const body = el("div", null, record ? (record.text || "No text stored for this id.") : "This id is not in the case brief.");
+    body.hidden = true;
+    button.onclick = () => { body.hidden = !body.hidden; };
+    row.append(el("div", null, ""));
+    row.append(button);
+    row.append(body);
+  });
   return row;
 }
 
@@ -1052,7 +1154,7 @@ function setMode(mode) {
   if (!suppressHistory && mode !== "alerts") remember("view=" + mode);
   document.getElementById("layout").classList.toggle("single", mode !== "alerts");
   document.getElementById("browser").style.display = mode === "alerts" ? "" : "none";
-  ["alerts", "answers", "try", "screen"].forEach(name => {
+  ["alerts", "answers", "try", "screen", "dashboard"].forEach(name => {
     document.getElementById("mode-" + name).classList.toggle("active", name === mode);
   });
   if (mode === "alerts") {
@@ -1066,6 +1168,72 @@ function setMode(mode) {
   if (mode === "answers") loadAnswers(false);
   if (mode === "try") showTry();
   if (mode === "screen") showScreen();
+  if (mode === "dashboard") loadDashboard();
+}
+
+function loadDashboard() {
+  const root = document.getElementById("detail");
+  root.replaceChildren(el("p", "empty", "Loading the dashboard…"));
+  fetch("/api/dashboard").then(response => {
+    if (!response.ok) throw new Error("The dashboard request failed (" + response.status + ").");
+    return response.json();
+  }).then(report => {
+    root.replaceChildren();
+    root.append(el("h2", null, "Performance"));
+    root.append(el("p", "meta", "Figures are computed from the saved decisions and the practice file. The 769 unlabelled hits are not an accuracy score."));
+    const hits = el("div", "dash");
+    [["processed", report.hits.processed], ["cleared", report.hits.cleared], ["confirmed", report.hits.confirmed], ["review", report.hits.review]].forEach(pair => {
+      const card = el("div", "count");
+      card.append(el("b", null, String(pair[1])));
+      card.append(document.createTextNode(pair[0] + " hits"));
+      hits.append(card);
+    });
+    root.append(el("h3", null, "Hits"));
+    root.append(hits);
+    const alertsBox = el("div", "dash");
+    [["processed", report.alerts.processed], ["cleared", report.alerts.cleared], ["escalated", report.alerts.escalated], ["need an analyst", report.alerts.needs_analyst]].forEach(pair => {
+      const card = el("div", "count");
+      card.append(el("b", null, String(pair[1])));
+      card.append(document.createTextNode(pair[0] + " alerts"));
+      alertsBox.append(card);
+    });
+    root.append(el("h3", null, "Alerts"));
+    root.append(alertsBox);
+    const practice = report.practice || {};
+    root.append(el("h3", null, "Labelled practice hits only"));
+    root.append(el("p", null, practice.right + " / " + practice.labelled + " decisions. Score " + practice.score + ". Unsafe clearances: " + practice.unsafe_clearances + "."));
+    root.append(el("p", "meta", "Unlabelled development hits: " + report.unlabelled_hits + ". No accuracy is claimed for them."));
+    const timing = report.timing || {};
+    root.append(el("h3", null, "Processing time"));
+    if (!timing.measured) root.append(el("p", "missing-row", "This process has not measured a run."));
+    else root.append(el("p", null, timing.elapsed_ms + " ms for " + report.hits.processed + " hits (" + timing.ms_per_hit + " ms per hit). Measured " + timing.measured_at + "."));
+    root.append(el("p", "meta", timing.what || ""));
+    root.append(el("h3", null, "Hits by list type"));
+    const table = document.createElement("table");
+    table.className = "score";
+    const header = document.createElement("tr");
+    ["List type", "Hits"].forEach(label => header.append(el("th", null, label)));
+    table.append(header);
+    (report.list_types || []).forEach(row => {
+      const tr = document.createElement("tr");
+      tr.append(el("td", null, row.list_type));
+      tr.append(el("td", null, String(row.hits)));
+      table.append(tr);
+    });
+    root.append(table);
+    root.append(el("h3", null, "Reason codes"));
+    ["clearing", "confirming", "review"].forEach(name => {
+      const line = ((report.reason_codes || {})[name] || []).map(item => item.reason_code + " " + item.hits).join(" · ");
+      root.append(el("p", null, name + ": " + (line || "none")));
+    });
+    const baseline = report.name_only_baseline || {};
+    root.append(el("h3", null, "Name-only baseline, same 50 labels"));
+    root.append(el("p", null, baseline.right + " / " + baseline.labelled + ". Score " + baseline.score + ". Unsafe clearances: " + baseline.unsafe_clearances + "."));
+    root.append(el("p", "meta", baseline.rule || ""));
+  }).catch(error => {
+    root.replaceChildren(el("h2", null, "Performance"));
+    root.append(el("p", "cross", error.message || "The dashboard could not be loaded."));
+  });
 }
 
 function loadAnswers(live) {
@@ -1353,6 +1521,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   document.getElementById("q").addEventListener("input", renderList);
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
+  document.getElementById("mode-dashboard").onclick = () => setMode("dashboard");
   document.getElementById("mode-screen").onclick = () => setMode("screen");
   document.getElementById("mode-alerts").onclick = () => setMode("alerts");
   document.getElementById("mode-answers").onclick = () => setMode("answers");
@@ -1391,6 +1560,28 @@ class Handler(BaseHTTPRequestHandler):
     world = None
     saved = {}
     labels = []
+    analyst_path = ""
+    measured_ms = None
+    measured_at = None
+
+    def _dashboard(self):
+        label_ids = {row["hit_id"] for row in self.labels}
+        baseline = {}
+        for row in self.saved.values():
+            if row["hit_id"] not in label_ids:
+                continue
+            hit = self.world.hits.get(row["hit_id"]) or {}
+            alert = self.world.alerts.get(row["alert_id"]) or {}
+            screened = (alert.get("customer") or {}).get("name")
+            baseline[row["hit_id"]] = name_only_decision(self.world.names, screened, hit)
+        return summarise(
+            list(self.saved.values()),
+            self.world.hits,
+            self.labels,
+            baseline,
+            self.measured_ms,
+            self.measured_at,
+        )
 
     def log_message(self, fmt, *args):
         return
@@ -1447,6 +1638,16 @@ class Handler(BaseHTTPRequestHandler):
             brief = build_brief(self.world, hit_id)
             self._json(brief, 404 if brief.get("error") else 200)
             return
+        if parsed.path == "/api/dashboard":
+            self._json(self._dashboard())
+            return
+        if parsed.path == "/api/analyst":
+            hit_id = (parse_qs(parsed.query).get("hit_id") or [""])[0]
+            if hit_id and hit_id not in self.world.hits:
+                self._json({"error": "Unknown hit."}, 404)
+                return
+            self._json({"events": analyst_history(self.analyst_path, hit_id)})
+            return
         if parsed.path in ("/", "/index.html"):
             body = PAGE.encode("utf-8")
             self.send_response(200)
@@ -1478,6 +1679,24 @@ class Handler(BaseHTTPRequestHandler):
                 candidate["list_sources"] = as_list(hit.get("sources"))
                 candidate["position_or_allegation"] = as_text(hit.get("position_or_allegation"))
             self._json(result)
+            return
+        if parsed.path == "/api/analyst":
+            hit_id = str(payload.get("hit_id") or "")
+            brief = build_brief(self.world, hit_id) if hit_id in self.world.hits else {"error": "Unknown hit."}
+            allowed = [record.get("id") for record in brief.get("records") or []]
+            status, body = analyst_record(
+                self.analyst_path,
+                hit_id,
+                payload.get("action"),
+                payload.get("rationale") if isinstance(payload.get("rationale"), str) else "",
+                payload.get("analyst") if isinstance(payload.get("analyst"), str) else "",
+                notes=payload.get("notes") if isinstance(payload.get("notes"), str) else "",
+                idempotency_key=payload.get("idempotency_key"),
+                cited_ids=payload.get("cited_ids") or [],
+                allowed_ids=allowed,
+                hit_known=hit_id in self.world.hits,
+            )
+            self._json(body, status)
             return
         if parsed.path == "/api/investigate":
             if length > 10000:
@@ -1518,6 +1737,11 @@ def main():
     print(f"Loading the decision engine for live traces ({Handler.bundle['hits']} hits)...")
     Handler.world = World(folder)
     Handler.bundle["screen_examples"] = Handler.world.suggest_screen_examples()
+    Handler.analyst_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "analyst_log.jsonl")
+    started = time.perf_counter()
+    Handler.world.decide_all()
+    Handler.measured_ms = (time.perf_counter() - started) * 1000.0
+    Handler.measured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Demo at http://127.0.0.1:{PORT}  ({Handler.bundle['hits']} hits)")
     server.serve_forever()

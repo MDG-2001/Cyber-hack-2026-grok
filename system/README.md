@@ -65,9 +65,25 @@ The evidence list is only the records that decided the hit: the customer records
 
 The list type on a profile (sanctions, PEP, adverse media, and the rest) is shown on the review page for context only. Per the brief, decisions are about identity, not severity, so the engine treats every list the same.
 
-## Optional Grok advisory
+## Dashboard
 
-`POST /api/investigate` with `{"hit_id": "H-..."}` asks Grok for an advisory on that hit. It does not change the screening decision and it does not rewrite `output/dev.jsonl`. Set `XAI_API_KEY` to enable it, and `XAI_MODEL` if you do not want the default `grok-4`. With no key, the endpoint says live Grok was not called. Text inside customer notes and search snippets is treated as evidence, not as instructions. A claim that cites an evidence id from outside the case is rejected.
+`GET /api/dashboard` counts hits and alerts from the saved file, scores the 50 practice labels, and scores a name-only baseline on those same 50 labels. The other development hits are reported as unlabelled. The page also shows one measured engine run: total milliseconds, milliseconds per hit, and the UTC time of that measurement. Open it from Dashboard on the review page.
+
+The baseline predicts `SAME_ENTITY` when the screened name agrees with the hit name or an alias, and `REVIEW` otherwise. It never predicts `DIFFERENT_ENTITY`.
+
+## Analyst workspace
+
+Search and the list-type filter are on the alerts view. Open an alert to see the screened customer beside the watchlist profile, the deterministic reason, supporting and contradicting facts, and the original record text.
+
+Record a human decision with Confirm match, Clear match, or Escalate. A rationale of 10 to 2000 characters is required. Notes are optional. Reopen adds a new line and does not delete the earlier one. The log is `system/state/analyst_log.jsonl`. That directory is gitignored. It is not `output/dev.jsonl` and `system/run` does not read it.
+
+`POST /api/analyst` rejects a bad action, a short rationale, an unknown hit, or an evidence id that is not on the case, with HTTP 400. The same idempotency key returns the original event. Sending the same action and rationale again does not add a line.
+
+## Optional model advisory
+
+`POST /api/investigate` with `{"hit_id": "H-..."}` asks a model for an advisory. It does not change the screening decision and it does not rewrite `output/dev.jsonl`. `system/run` never calls it.
+
+If `OPENROUTER_API_KEY` is set, that provider is used. The model is `OPENROUTER_MODEL`, or `x-ai/grok-4` when the variable is unset. Otherwise `XAI_API_KEY` is used, with `XAI_MODEL` or `grok-4`. When both keys are set, OpenRouter is used. Keys are read from the environment only. They are not sent to the browser and they are not written to the log. With no key, the endpoint says live AI was not called. A timeout, HTTP 4xx, 429, 5xx, or a non-JSON body leaves the screening decision unchanged. Text inside notes and search snippets is evidence, not instructions. A claim that cites an evidence id from outside the case is rejected. In the page, verified facts and model readings are labelled differently, and each cited id opens the record text.
 
 ## Determinism, model, and cost
 
