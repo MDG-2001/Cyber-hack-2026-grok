@@ -138,7 +138,7 @@ def summarise(predictions, hits_by_id, labels, baseline_answers, elapsed_ms, mea
             "elapsed_ms": None if elapsed_ms is None else round(elapsed_ms, 1),
             "ms_per_hit": None if not elapsed_ms or not predictions else round(elapsed_ms / len(predictions), 2),
             "measured_at": measured_at,
-            "what": "One full run of the deterministic engine over every development hit, timed in this process.",
+            "what": "One decide_all run after the data files were already loaded. It does not include reading the JSONL files from disk.",
         },
         "list_types": ordered_lists,
         "reason_codes": {
