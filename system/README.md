@@ -67,6 +67,26 @@ The evidence list is only the records that decided the hit: the customer records
 
 No model and no prompts. The rules are fixed code, so two runs write the same bytes. A development run takes about 4 seconds on this machine and costs nothing. An alert is cleared only when every hit is `DIFFERENT_ENTITY`. One `SAME_ENTITY` escalates the alert to compliance. Anything else still needs an analyst.
 
+## Screen a new customer
+
+`POST /api/screen` searches every watchlist profile with the same name rules, then judges each name match with the same decision engine. The body is JSON. A hit's dates and countries in the response come from the watchlist profile, its notes, or web search results, not from the customer you typed.
+
+```bash
+curl -s http://127.0.0.1:8766/api/screen \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_name":"Sousa da Silva, Matheus","customer_type":"Individual","customer_dob":"1967","customer_countries":"Japan"}'
+```
+
+The same call from the command line, without the page:
+
+```bash
+python3 system/screen_one.py path/to/data --name "Sousa da Silva, Matheus" --dob 1967 --country Japan
+```
+
+On the development set that customer passes: the only name match is a different person. The page's other example buttons escalate Adnan Muhammad Amin Al-Rawi, born 17 January 1985, and leave Mohammed Bin Awadh Bin Abdul Rahman Al Hassan, with no date of birth, for an analyst.
+
+The verdict is `PASS` (no name match, or every match is a different person), `ESCALATE` (any match is the same person), or `NEEDS_ANALYST`.
+
 ## The review page
 
 `python3 system/serve.py <data folder> output/dev.jsonl` loads this same engine. Run decision, Test against answers and Try your own all call it, so a live result matches the saved file. Demo picks on the development set:

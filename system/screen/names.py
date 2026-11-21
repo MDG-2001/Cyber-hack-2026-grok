@@ -126,6 +126,23 @@ class NameIndex:
     def parts_match(self, left: str, right: str) -> bool:
         return _parts_match(left, right, self._group_of.get(left, -1), self._group_of.get(right, -1))
 
+    def matched_labels(self, left: list[str], right: list[str]) -> list[str]:
+        """Parts that agree, using the same part rules as agree(). Does not decide a hit."""
+        labels = []
+        used_left = 0
+        used_right = 0
+        for index, part in enumerate(left):
+            for other, candidate in enumerate(right):
+                if used_left & (1 << index) or used_right & (1 << other):
+                    continue
+                if not self.parts_match(part, candidate):
+                    continue
+                used_left |= 1 << index
+                used_right |= 1 << other
+                labels.append(part if part == candidate else part + "~" + candidate)
+                break
+        return labels
+
 
 def _expand(parts: list[str]) -> list[tuple[int, str]]:
     expanded: list[tuple[int, str]] = []

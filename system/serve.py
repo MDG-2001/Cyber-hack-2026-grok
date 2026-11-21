@@ -435,6 +435,7 @@ PAGE = """<!DOCTYPE html>
     font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; color: var(--ink);
   }
   .modes button.active, .run { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  #mode-screen { background: #1d1a16; color: #f3efe4; border-color: #1d1a16; font-weight: 700; }
   .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0 4px; }
   .compare > div { background: #faf7f1; border-radius: 10px; padding: 10px 12px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
   .compare h3 { margin: 0 0 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
@@ -483,6 +484,7 @@ PAGE = """<!DOCTYPE html>
 <div class="workload" id="workload"></div>
 <div class="toolbar">
   <div class="modes">
+    <button type="button" id="mode-screen">Screen a new customer</button>
     <button type="button" id="mode-alerts" class="active">Alerts</button>
     <button type="button" id="mode-answers">Test against answers</button>
     <button type="button" id="mode-try">Try your own</button>
@@ -723,7 +725,7 @@ function runHit(hitId, host) {
 function setMode(mode) {
   document.getElementById("layout").classList.toggle("single", mode !== "alerts");
   document.getElementById("browser").style.display = mode === "alerts" ? "" : "none";
-  ["alerts", "answers", "try"].forEach(name => {
+  ["alerts", "answers", "try", "screen"].forEach(name => {
     document.getElementById("mode-" + name).classList.toggle("active", name === mode);
   });
   if (mode === "alerts") {
@@ -736,6 +738,7 @@ function setMode(mode) {
   root.replaceChildren(el("p", "empty", "Loading…"));
   if (mode === "answers") loadAnswers(false);
   if (mode === "try") showTry();
+  if (mode === "screen") showScreen();
 }
 
 function loadAnswers(live) {
@@ -785,6 +788,90 @@ function field(form, label, name, value) {
   input.name = name;
   input.value = value || "";
   form.append(input);
+}
+
+function fillScreen(example) {
+  const form = document.getElementById("screen-form");
+  if (!form || !example) return;
+  ["customer_name", "aliases", "customer_type", "customer_dob", "customer_countries", "email", "phone"].forEach(name => {
+    if (form.elements[name]) form.elements[name].value = example[name] || (name === "customer_type" ? "Individual" : "");
+  });
+}
+
+function showScreenResult(host, payload) {
+  host.replaceChildren();
+  const banner = el("div", "step " + (payload.verdict === "PASS" ? "pass" : payload.verdict === "ESCALATE" ? "contradiction" : "unknown"));
+  banner.style.animationDelay = "0s";
+  banner.append(el("b", null, payload.verdict === "PASS" ? "Pass" : payload.verdict === "ESCALATE" ? "Escalate to compliance" : "Needs an analyst"));
+  banner.append(el("div", null, payload.summary || ""));
+  banner.append(el("div", "meta", "Checked " + payload.checked_hits + " hits (" + payload.checked_profiles + " profiles). " + payload.candidate_count + " shared a name."));
+  host.append(banner);
+  (payload.candidates || []).forEach((candidate, index) => {
+    const card = el("article", "hit " + candidate.decision);
+    card.append(el("strong", null, candidate.name + " · " + candidate.hit_id));
+    card.append(el("div", "meta", candidate.why + " · " + candidate.reason_code));
+    card.append(el("p", "reason", candidate.reason));
+    if ((candidate.sources || []).length) {
+      card.append(el("div", "evidence-label", "External sources, not the customer's record"));
+      candidate.sources.forEach(source => {
+        card.append(el("div", null, source.origin + ": " + source.fact));
+      });
+    }
+    const steps = el("div", "trace");
+    renderSteps(steps, {steps: candidate.steps || []});
+    card.append(steps);
+    host.append(card);
+    card.style.animationDelay = Math.min(index * 0.08, 0.6) + "s";
+  });
+}
+
+function showScreen() {
+  const root = document.getElementById("detail");
+  root.replaceChildren();
+  root.append(el("h2", null, "Screen a new customer"));
+  root.append(el("p", "meta", "The watchlist search uses the same name rules as a real alert. Dates and countries on a match come from the profile, its notes, or web search results."));
+  const examples = el("div", "demos");
+  (window.screenExamples || []).forEach(example => {
+    const button = el("button", null, example.label + " · " + example.verdict);
+    button.type = "button";
+    button.onclick = () => { fillScreen(example); document.getElementById("screen-form").requestSubmit(); };
+    examples.append(button);
+  });
+  root.append(examples);
+  const form = el("form", "try");
+  form.id = "screen-form";
+  const first = (window.screenExamples || [])[0] || {};
+  field(form, "Full name", "customer_name", first.customer_name || "");
+  field(form, "Aliases, optional", "aliases", first.aliases || "");
+  form.append(el("label", null, "Person or company"));
+  const kind = document.createElement("select");
+  kind.name = "customer_type";
+  ["Individual", "Company"].forEach(option => {
+    const node = el("option", null, option);
+    node.value = option;
+    if ((first.customer_type || "Individual") === option) node.selected = true;
+    kind.append(node);
+  });
+  form.append(kind);
+  field(form, "Date of birth or incorporation date", "customer_dob", first.customer_dob || "");
+  field(form, "Countries, nationality, or document country", "customer_countries", first.customer_countries || "");
+  field(form, "Email, optional", "email", "");
+  field(form, "Phone, optional", "phone", "");
+  const button = el("button", "run", "Screen");
+  button.type = "submit";
+  form.append(button);
+  const host = el("div", "trace");
+  form.onsubmit = event => {
+    event.preventDefault();
+    const body = {};
+    new FormData(form).forEach((value, key) => { body[key] = value; });
+    host.replaceChildren(el("div", "meta", "Searching every watchlist profile…"));
+    fetch("/api/screen", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+      .then(response => response.json())
+      .then(payload => showScreenResult(host, payload))
+      .catch(() => host.replaceChildren(el("div", "cross", "Screening failed.")));
+  };
+  root.append(form, host);
 }
 
 function showTry() {
@@ -844,6 +931,7 @@ function showTry() {
 
 fetch("/api/bundle").then(r => r.json()).then(data => {
   alerts = data.alerts;
+  window.screenExamples = data.screen_examples || [];
   const counts = document.getElementById("counts");
   function chip(key, className, number, label) {
     const button = el("button", "count" + (className ? " " + className : "") + (filter === key ? " active" : ""));
@@ -897,6 +985,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   document.getElementById("q").addEventListener("input", renderList);
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
+  document.getElementById("mode-screen").onclick = () => setMode("screen");
   document.getElementById("mode-alerts").onclick = () => setMode("alerts");
   document.getElementById("mode-answers").onclick = () => setMode("answers");
   document.getElementById("mode-try").onclick = () => setMode("try");
@@ -1009,6 +1098,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/try":
             self._json(self._trace(self.world.explain_entered(payload)))
             return
+        if parsed.path == "/api/screen":
+            self._json(self.world.screen_customer(payload))
+            return
         if parsed.path == "/api/practice/run":
             live = {}
             for label in self.labels:
@@ -1040,6 +1132,7 @@ def main():
     Handler.labels = read_jsonl(practice_path) if os.path.exists(practice_path) else []
     print(f"Loading the decision engine for live traces ({Handler.bundle['hits']} hits)...")
     Handler.world = World(folder)
+    Handler.bundle["screen_examples"] = Handler.world.suggest_screen_examples()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Demo at http://127.0.0.1:{PORT}  ({Handler.bundle['hits']} hits)")
     server.serve_forever()

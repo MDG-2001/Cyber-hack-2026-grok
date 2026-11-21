@@ -292,6 +292,7 @@ class World:
         self._link_people()
         self._index_customers()
         self._party_cache: dict[tuple[str, ...], Party] = {}
+        self._watchlist_cache = None
 
     def _link_people(self):
         self.people = UnionFind(self.customers)
@@ -1319,6 +1320,256 @@ class World:
                 "categories": hit.get("categories") or [],
             },
         }
+
+    def _form_party_and_alert(self, payload: dict):
+        customer_name = (payload.get("customer_name") or payload.get("name") or "").strip()
+        aliases = [
+            part.strip()
+            for part in str(payload.get("aliases") or payload.get("customer_aliases") or "").replace(";", ",").split(",")
+            if part.strip()
+        ]
+        customer_type = payload.get("customer_type") or payload.get("type") or "Individual"
+        customer_dob = parse_when(payload.get("customer_dob") or payload.get("dob"))
+        customer_countries = set()
+        for part in str(payload.get("customer_countries") or payload.get("country") or "").replace(";", ",").split(","):
+            country = canon(part.strip())
+            if country:
+                customer_countries.add(country)
+        company = is_company(customer_type)
+        names = []
+        if customer_name:
+            names.append((customer_name, "entered"))
+        for alias in aliases:
+            names.append((alias, "entered"))
+        party = Party(
+            record_ids=["ENTERED"],
+            seed_id="ENTERED",
+            company=company,
+            identity=Identity(
+                source_id="entered",
+                name=customer_name or None,
+                dob=customer_dob,
+                document_country=next(iter(sorted(customer_countries)), None),
+                when="",
+            ),
+            names=names,
+            verified_name=bool(customer_name),
+            dob=customer_dob,
+            dob_source_id="entered" if customer_dob else None,
+            countries=customer_countries,
+            country_sources={country: {"entered"} for country in customer_countries},
+        )
+        alert = {
+            "_entered": True,
+            "alert_id": "ENTERED",
+            "screened_at": "2026-11-21",
+            "customer": {
+                "name": customer_name,
+                "entity_type": "Company" if company else "Individual",
+                "dob": (payload.get("customer_dob") or payload.get("dob") or None),
+                "country": next(iter(sorted(customer_countries)), None),
+                "city": None,
+            },
+            "account_ref": None,
+            "login_handle": None,
+            "email": (payload.get("email") or None),
+            "hit_ids": [],
+        }
+        return party, alert
+
+    def _watchlist(self):
+        if self._watchlist_cache is not None:
+            return self._watchlist_cache
+        groups = {}
+        for hit in self.hits.values():
+            key = (
+                (hit.get("name") or "").casefold(),
+                tuple(hit.get("aliases") or []),
+                tuple(str(item) for item in (hit.get("dobs") or [])),
+                (hit.get("profile_notes") or "")[:400],
+            )
+            groups.setdefault(key, []).append(hit)
+        profiles = []
+        for grouped in groups.values():
+            grouped = sorted(grouped, key=lambda item: item["hit_id"])
+            primary = grouped[0]
+            company = is_company(primary.get("entity_type"))
+            labelled = []
+            for value in [primary.get("name"), primary.get("best_matching_name"), *(primary.get("aliases") or [])]:
+                if not value:
+                    continue
+                tokens = self.names.tokens(value, company=company)
+                if tokens:
+                    labelled.append((value, tokens))
+            profiles.append({
+                "hit": primary,
+                "hit_ids": [item["hit_id"] for item in grouped],
+                "names": labelled,
+                "company": company,
+            })
+        profiles.sort(key=lambda item: item["hit"]["hit_id"])
+        self._watchlist_cache = profiles
+        return profiles
+
+    def _fact_sources(self, hit: dict, facts: HitFacts) -> list:
+        """Where each listed fact came from. None of these are the customer's own record."""
+        sources = []
+        if hit.get("dobs"):
+            sources.append({
+                "origin": "Watchlist profile",
+                "fact": "Date of birth field: " + ", ".join(str(item) for item in hit.get("dobs") or []),
+            })
+        if facts.birth_origin == "notes":
+            sources.append({
+                "origin": "Profile notes",
+                "fact": "A birth date or age in the first paragraph of the watchlist profile.",
+            })
+        if facts.birth_origin == "search":
+            sources.append({
+                "origin": "Web search results",
+                "fact": "A birth year from search results about this listing: " + ", ".join(facts.search_ids),
+            })
+        if facts.reports:
+            sources.append({
+                "origin": "Profile notes",
+                "fact": "Earliest dated report " + min(facts.reports, key=lambda item: (item.year, item.month or 0, item.day or 0)).label(),
+            })
+        if facts.death:
+            sources.append({
+                "origin": "Watchlist profile",
+                "fact": "Date of death " + facts.death.label(),
+            })
+        if facts.countries:
+            sources.append({
+                "origin": "Watchlist profile",
+                "fact": "Countries on the profile: " + joined(facts.countries),
+            })
+        return sources
+
+    def screen_customer(self, payload: dict) -> dict:
+        """Search every watchlist profile for this person, then judge each name match."""
+        party, alert = self._form_party_and_alert(payload)
+        customer_names = []
+        for display, _source in party.names:
+            tokens = self.names.tokens(display, company=party.company)
+            if tokens:
+                customer_names.append((display, tokens))
+        profiles = self._watchlist()
+        found = []
+        for profile in profiles:
+            best = None
+            for customer_label, customer_tokens in customer_names:
+                for hit_label, hit_tokens in profile["names"]:
+                    if not self.names.agree(customer_tokens, hit_tokens):
+                        continue
+                    parts = self.names.matched_labels(customer_tokens, hit_tokens)
+                    if best is None or len(parts) > best["score"]:
+                        best = {
+                            "customer_name": customer_label,
+                            "hit_name": hit_label,
+                            "parts": parts,
+                            "score": len(parts),
+                        }
+            if best is None:
+                continue
+            hit = profile["hit"]
+            outcome = self.judge(alert, hit, party)
+            facts = self.hit_facts(hit)
+            found.append({
+                "hit_id": hit["hit_id"],
+                "alert_id": hit.get("alert_id"),
+                "also_hit_ids": profile["hit_ids"],
+                "name": hit.get("name") or "",
+                "matched_name": best["hit_name"],
+                "matched_parts": best["parts"],
+                "score": best["score"],
+                "why": (
+                    str(best["score"]) + " name part(s) agree (" + ", ".join(best["parts"]) + ") with "
+                    + best["hit_name"]
+                    if best["parts"]
+                    else "The names agree with " + best["hit_name"]
+                ),
+                "decision": outcome.decision,
+                "reason_code": outcome.reason_code,
+                "reason": outcome.reason,
+                "evidence": outcome.evidence,
+                "customer_record_id": outcome.customer_record_id,
+                "sources": self._fact_sources(hit, facts),
+                "steps": self._steps(alert, hit, [party], outcome),
+            })
+        found.sort(key=lambda item: (-item["score"], item["hit_id"]))
+        decisions = [item["decision"] for item in found]
+        if not found or all(item == "DIFFERENT_ENTITY" for item in decisions):
+            verdict = "PASS"
+            summary = (
+                "No watchlist profile shares this name."
+                if not found
+                else "Every name match is a different person, so this customer passes screening."
+            )
+        elif any(item == "SAME_ENTITY" for item in decisions):
+            verdict = "ESCALATE"
+            summary = "At least one watchlist profile is the same person. Escalate to compliance."
+        else:
+            verdict = "NEEDS_ANALYST"
+            summary = "No profile is confirmed as this customer, and at least one name match cannot be cleared."
+        return {
+            "checked_hits": len(self.hits),
+            "checked_profiles": len(profiles),
+            "candidate_count": len(found),
+            "verdict": verdict,
+            "summary": summary,
+            "candidates": found,
+        }
+
+    def suggest_screen_examples(self) -> list:
+        """Three inputs, drawn from real watchlist profiles, with known verdicts."""
+        wanted = {"ESCALATE": None, "PASS": None, "NEEDS_ANALYST": None}
+        hits = sorted(self.hits.values(), key=lambda item: (-len(self.names.tokens(item.get("name") or "", company=is_company(item.get("entity_type")))), item["hit_id"]))
+        for hit in hits:
+            if all(wanted.values()):
+                break
+            parts = self.names.tokens(hit.get("name") or "", company=is_company(hit.get("entity_type")))
+            if len(parts) < 2:
+                continue
+            countries = sorted(hit_countries(hit))
+            if not countries:
+                continue
+            dobs = [str(item) for item in (hit.get("dobs") or []) if item]
+            base = {
+                "customer_name": hit.get("name") or "",
+                "customer_type": "Company" if is_company(hit.get("entity_type")) else "Individual",
+                "customer_countries": ", ".join(countries),
+                "hit_id": hit["hit_id"],
+            }
+            if wanted["ESCALATE"] is None and dobs:
+                payload = dict(base)
+                payload["customer_dob"] = dobs[0]
+                payload["label"] = "Matches a listing"
+                result = self.screen_customer(payload)
+                if result["verdict"] == "ESCALATE":
+                    payload["verdict"] = "ESCALATE"
+                    wanted["ESCALATE"] = payload
+            if wanted["PASS"] is None and dobs:
+                parsed = parse_when(dobs[0])
+                year = parsed.year - 30 if parsed is not None else None
+                if year and 1900 < year < 2020:
+                    payload = dict(base)
+                    payload["customer_dob"] = str(year)
+                    payload["customer_countries"] = "Japan" if "Japan" not in countries else "Brazil"
+                    payload["label"] = "Clears on the date of birth"
+                    result = self.screen_customer(payload)
+                    if result["verdict"] == "PASS":
+                        payload["verdict"] = "PASS"
+                        wanted["PASS"] = payload
+            if wanted["NEEDS_ANALYST"] is None:
+                payload = dict(base)
+                payload["customer_dob"] = ""
+                payload["label"] = "Needs an analyst"
+                result = self.screen_customer(payload)
+                if result["verdict"] == "NEEDS_ANALYST":
+                    payload["verdict"] = "NEEDS_ANALYST"
+                    wanted["NEEDS_ANALYST"] = payload
+        return [item for item in (wanted["ESCALATE"], wanted["PASS"], wanted["NEEDS_ANALYST"]) if item]
 
     def decide_hit(self, alert: dict, hit: dict) -> Outcome:
         parties = self.resolve(alert)
