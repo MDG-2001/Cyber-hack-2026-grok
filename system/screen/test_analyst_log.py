@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 
-from screen.analyst_log import history, record
+from screen.analyst_log import history, record, unreadable_lines
 
 
 class AnalystLogTests(unittest.TestCase):
@@ -80,6 +80,21 @@ class AnalystLogTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("NOT-A-RECORD", body["error"])
         self.assertEqual(history(self.path, "H-1"), [])
+
+    def test_a_corrupt_line_is_skipped_and_the_file_is_kept(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("{broken\n")
+            handle.write('{"hit_id": "H-1", "action": "ESCALATE", "rationale": "kept", "analyst": "Ada"}\n')
+        self.assertEqual(unreadable_lines(self.path), [1])
+        before = open(self.path, encoding="utf-8").read()
+        status, body = record(self.path, "H-9", "CLEAR_MATCH", "A later readable decision.", "Ada Quinn")
+        self.assertEqual(status, 201)
+        self.assertEqual(body["unreadable_lines"], [1])
+        after = open(self.path, encoding="utf-8").read()
+        self.assertTrue(after.startswith(before))
+        self.assertIn("{broken", after)
+        self.assertEqual([event["hit_id"] for event in history(self.path, "H-1")], ["H-1"])
+        self.assertEqual(len(history(self.path, "H-9")), 1)
 
     def test_notes_over_the_limit_are_rejected(self):
         status, body = record(

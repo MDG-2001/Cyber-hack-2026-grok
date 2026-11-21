@@ -25,11 +25,11 @@ def record(path, hit_id, action, rationale, analyst, notes="", idempotency_key=N
         return 400, {"error": error}
     cited = [str(item) for item in (cited_ids or [])]
     with _LOCK:
-        events = _read(path)
+        events, problems = _read(path)
         if idempotency_key:
             for event in events:
                 if event.get("idempotency_key") == idempotency_key:
-                    return 200, {"status": "duplicate", "event": event}
+                    return 200, {"status": "duplicate", "event": event, "unreadable_lines": problems}
         prior = [event for event in events if event.get("hit_id") == hit_id]
         previous = prior[-1]["action"] if prior else None
         if action == "REOPEN" and previous is None:
@@ -41,7 +41,7 @@ def record(path, hit_id, action, rationale, analyst, notes="", idempotency_key=N
             and prior[-1].get("rationale") == rationale
             and list(prior[-1].get("cited_ids") or []) == cited
         ):
-            return 200, {"status": "unchanged", "event": prior[-1]}
+            return 200, {"status": "unchanged", "event": prior[-1], "unreadable_lines": problems}
         event = {
             "event_id": uuid.uuid4().hex,
             "hit_id": hit_id,
@@ -55,11 +55,20 @@ def record(path, hit_id, action, rationale, analyst, notes="", idempotency_key=N
             "previous_action": previous,
         }
         _append(path, event)
-    return 201, {"status": "recorded", "event": event}
+    return 201, {"status": "recorded", "event": event, "unreadable_lines": problems}
 
 
 def history(path, hit_id):
-    return [event for event in _read(path) if event.get("hit_id") == hit_id]
+    events, _problems = _read(path)
+    if not hit_id:
+        return events
+    return [event for event in events if event.get("hit_id") == hit_id]
+
+
+def unreadable_lines(path):
+    """Line numbers that could not be parsed. The file is not rewritten."""
+    _events, problems = _read(path)
+    return problems
 
 
 def _validate(hit_id, action, rationale, analyst, notes, idempotency_key, cited_ids, allowed_ids, hit_known):
@@ -96,13 +105,18 @@ def _validate(hit_id, action, rationale, analyst, notes, idempotency_key, cited_
 
 def _read(path):
     if not os.path.exists(path):
-        return []
+        return [], []
     rows = []
+    problems = []
     with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
                 rows.append(json.loads(line))
-    return rows
+            except json.JSONDecodeError:
+                problems.append(number)
+    return rows, problems
 
 
 def _append(path, event):

@@ -49,7 +49,15 @@ def build_brief(world, hit_id: str) -> dict:
         elif party.dob is None or not facts.births:
             missing.append(f"{who}: there is no reliable date of birth on both sides to compare.")
         elif not item["dob_agrees"] and not item["dob_mismatch"]:
-            missing.append(f"{who}: the dates are too close to confirm and too close to clear.")
+            confident = [birth for birth in facts.births if birth.confident]
+            uncertain = [birth for birth in facts.births if not birth.confident]
+            if uncertain and not confident:
+                missing.append(
+                    f"{who}: the only birth year on the hit is inferred with low confidence, "
+                    "so it is not used to clear or to confirm."
+                )
+            else:
+                missing.append(f"{who}: the dates are too close to confirm and too close to clear.")
         if item["location_agree"]:
             supporting.append(_claim(
                 f"{who}: a country is shared with the hit.",
@@ -60,7 +68,6 @@ def build_brief(world, hit_id: str) -> dict:
                 f"{who}: every country on the customer differs from every country on the hit.",
                 _all_country_ids(party),
             ))
-            contradicting_countries = True
         elif item["location_mismatch"] and item["name_agrees"] and item["dob_agrees"]:
             missing.append(
                 f"{who}: name and date of birth agree, so the country difference cannot clear the hit."
