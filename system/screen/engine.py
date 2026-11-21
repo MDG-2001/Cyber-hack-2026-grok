@@ -33,6 +33,10 @@ from .dates import (
     parse_when,
 )
 from .names import NameIndex, key_tokens
+
+
+def _search_key(name: str):
+    return frozenset(token for token in key_tokens(name or "") if len(token) > 1)
 from .notes import lived_countries, parse_identity
 
 MONTH = (
@@ -93,6 +97,36 @@ def first_paragraph(text: str) -> str:
     if not text:
         return ""
     return re.split(r"\n\s*\n", text, maxsplit=1)[0]
+
+
+_BORN_ON = re.compile(
+    rf"\bborn\s+on\s+((?:{MONTH})\s+\d{{1,2}},\s*\d{{4}}"
+    rf"|\d{{1,2}}\s+(?:{MONTH})\s+\d{{4}}"
+    rf"|\d{{4}}-\d{{2}}-\d{{2}}"
+    rf"|\d{{1,2}}/\d{{1,2}}/\d{{4}})",
+    re.I,
+)
+_BORN_IN_YEAR = re.compile(r"\bborn\s+in\s+((?:19|20)\d{2})\b", re.I)
+
+
+def explicit_births(text: str) -> list[When]:
+    """A first-paragraph sentence that states a birth date, not only an age."""
+    found = []
+    seen = set()
+    for match in _BORN_ON.finditer(text or ""):
+        parsed = parse_when(match.group(1), origin="notes")
+        if parsed is not None and parsed.label() not in seen:
+            seen.add(parsed.label())
+            found.append(parsed)
+    if found:
+        return found
+    for match in _BORN_IN_YEAR.finditer(text or ""):
+        year = int(match.group(1))
+        label = f"{year:04d}"
+        if label not in seen:
+            seen.add(label)
+            found.append(When(years=(year,), origin="notes"))
+    return found
 
 
 def age_births(text: str, origin: str) -> list[When]:
@@ -525,7 +559,8 @@ class World:
         elif listed:
             births, origin = listed, "listed"
         else:
-            from_notes = age_births(first_paragraph(hit.get("profile_notes") or ""), "notes")
+            paragraph = first_paragraph(hit.get("profile_notes") or "")
+            from_notes = explicit_births(paragraph) or age_births(paragraph, "notes")
             if from_notes:
                 births, origin = from_notes, "notes"
             else:
@@ -533,7 +568,9 @@ class World:
                 origin = "search"
                 phrase = listing_phrase(hit)
                 countries = hit_countries(hit)
-                results = self.search_by_name.get(key_tokens(hit.get("name") or ""), [])
+                # Single-letter initials are not name parts, and the search index
+                # files a name by its remaining words.
+                results = self.search_by_name.get(_search_key(hit.get("name") or ""), [])
                 for result in sorted(results, key=lambda row: row["result_id"]):
                     blob = f"{result.get('title') or ''} {result.get('snippet') or ''}"
                     if phrase not in blob.lower():
@@ -1075,6 +1112,94 @@ class World:
             "hit": hit.get("name") or "",
         })
         return steps
+
+    def customer_picture(self, alert_id: str) -> dict:
+        alert = self.alerts.get(alert_id)
+        if alert is None:
+            return {"error": f"Unknown alert {alert_id}"}
+        parties = self.resolve(alert)
+        people = []
+        for party in parties:
+            records = []
+            phones = {}
+            for record_id in party.record_ids:
+                record = self.customers[record_id]
+                phone = digits(record.get("phone"))
+                dob = parse_when(record.get("dob"))
+                phones[record_id] = (phone, dob.label() if dob and dob.month and dob.day else None)
+                records.append({
+                    "record_id": record_id,
+                    "name": record.get("full_name") or "",
+                    "dob": record.get("dob") or "",
+                    "country": record.get("residence_country") or record.get("nationality") or "",
+                    "email": record.get("email") or "",
+                })
+            why = []
+            ids = party.record_ids
+            for i, left in enumerate(ids):
+                for right in ids[i + 1 :]:
+                    if phones[left][0] and phones[left] == phones[right]:
+                        why.append(f"{left} and {right} share a phone number and the same full date of birth.")
+            documents = {}
+            checks = []
+            for record_id in ids:
+                for check in self.checks_by_customer.get(record_id, []):
+                    number = (check.get("document_number") or "").strip()
+                    if check.get("result") == "approved" and number:
+                        documents.setdefault(number, set()).add(record_id)
+                    used = bool(party.identity and party.identity.source_id == check["check_id"])
+                    result = check.get("result") or ""
+                    if used:
+                        note = "Used as the verified identity. It is the latest approved check."
+                    elif result == "rejected":
+                        note = "Ignored. A rejected check is not evidence."
+                    elif result == "expired":
+                        note = "Ignored. An expired check is not evidence."
+                    elif result == "approved":
+                        note = "Approved, but an older check. The latest approved check is the one that counts."
+                    else:
+                        note = "Not used."
+                    checks.append({
+                        "check_id": check["check_id"],
+                        "record_id": record_id,
+                        "result": result,
+                        "checked_at": check.get("checked_at") or "",
+                        "verified_name": check.get("verified_name") or "",
+                        "used": used,
+                        "note": note,
+                    })
+            for number, owners in documents.items():
+                if len(owners) > 1:
+                    why.append(
+                        "Approved checks share document number "
+                        + number
+                        + " on "
+                        + ", ".join(sorted(owners))
+                        + "."
+                    )
+            if party.identity and str(party.identity.source_id).startswith("NOTE"):
+                checks.append({
+                    "check_id": party.identity.source_id,
+                    "record_id": party.seed_id,
+                    "result": "approved",
+                    "checked_at": party.identity.when,
+                    "verified_name": party.identity.name or "",
+                    "used": True,
+                    "note": "Used as the verified identity. It is written in an onboarding note, and it is the latest approved check.",
+                })
+            checks.sort(key=lambda item: (not item["used"], item["checked_at"], item["check_id"]))
+            people.append({
+                "seed_id": party.seed_id,
+                "record_ids": party.record_ids,
+                "records": records,
+                "why": why or ["A single customer record. Nothing else had to be merged."],
+                "checks": checks,
+            })
+        return {
+            "alert_id": alert_id,
+            "link": self.describe_link(alert, parties),
+            "people": people,
+        }
 
     def explain_hit(self, hit_id: str) -> dict:
         hit = self.hits.get(hit_id)

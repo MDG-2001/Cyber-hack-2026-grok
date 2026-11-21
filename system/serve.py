@@ -415,6 +415,15 @@ PAGE = """<!DOCTYPE html>
   .card b { font-family: ui-monospace, monospace; font-size: 12px; }
   .card .kind { color: var(--muted); font-size: 12px; }
   .empty { color: var(--muted); padding: 24px 4px; }
+  .workload {
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: end;
+    padding: 12px 28px 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px;
+  }
+  .workload strong { display: block; font-size: 20px; letter-spacing: -0.03em; }
+  .workload .hint { color: var(--muted); max-width: 36rem; }
+  .alert-status { display: inline-block; margin-left: 8px; }
+  .picture { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-bottom: 14px; }
+  .picture h2 { margin: 0 0 6px; font-size: 18px; }
   .toolbar {
     display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
     padding: 10px 28px; border-bottom: 1px solid var(--line); background: var(--paper);
@@ -471,13 +480,14 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div class="counts" id="counts"></div>
 </header>
+<div class="workload" id="workload"></div>
 <div class="toolbar">
   <div class="modes">
     <button type="button" id="mode-alerts" class="active">Alerts</button>
     <button type="button" id="mode-answers">Test against answers</button>
     <button type="button" id="mode-try">Try your own</button>
   </div>
-  <div class="demos" id="demos"></div>
+  <div class="demos" id="demos"><span class="meta">Demo picks</span></div>
 </div>
 <main id="layout">
   <aside id="browser">
@@ -500,6 +510,13 @@ const LABELS = {
 let alerts = [];
 let current = null;
 let filter = "ALL";
+let alertFilter = "ALL";
+
+function alertStatus(alert) {
+  if (alert.hits.some(hit => hit.decision === "SAME_ENTITY")) return "ESCALATED";
+  if (alert.hits.length && alert.hits.every(hit => hit.decision === "DIFFERENT_ENTITY")) return "CLEARED";
+  return "ANALYST";
+}
 
 function headline(alert) {
   if (alert.hits.some(hit => hit.decision === "SAME_ENTITY")) return "SAME_ENTITY";
@@ -510,6 +527,7 @@ function headline(alert) {
 function visible() {
   const query = document.getElementById("q").value.trim().toLowerCase();
   return alerts.filter(alert => {
+    if (alertFilter !== "ALL" && alertStatus(alert) !== alertFilter) return false;
     if (filter !== "ALL" && !alert.hits.some(hit => hit.decision === filter)) return false;
     if (!query) return true;
     const blob = [alert.alert_id, alert.name, alert.link, ...alert.hits.flatMap(hit => [hit.hit_id, hit.name, hit.decision, hit.reason_code])].join(" ").toLowerCase();
@@ -547,10 +565,23 @@ function show(alert) {
   root.replaceChildren();
   const screened = el("div", "screened");
   screened.append(el("div", "meta", alert.alert_id + (alert.screened_at ? " · screened " + alert.screened_at : "")));
-  screened.append(el("h2", null, alert.name));
+  const status = alertStatus(alert);
+  const statusLabel = {CLEARED: "Cleared", ESCALATED: "Escalated to compliance", ANALYST: "Needs analyst"}[status];
+  const title = el("h2", null, "");
+  title.append(document.createTextNode(alert.name));
+  title.append(el("span", "pill alert-status " + (status === "CLEARED" ? "DIFFERENT_ENTITY" : status === "ESCALATED" ? "SAME_ENTITY" : "REVIEW"), statusLabel));
+  screened.append(title);
   const bits = [alert.entity_type, alert.dob, alert.country, alert.city, alert.link].filter(Boolean);
   screened.append(el("div", "meta", bits.join(" · ") || "No screened details beyond the name"));
   root.append(screened);
+  const picture = el("div", "picture");
+  picture.append(el("h2", null, "Customer picture"));
+  picture.append(el("p", "meta", "Loading the records behind this alert…"));
+  root.append(picture);
+  fetch("/api/picture?alert_id=" + encodeURIComponent(alert.alert_id))
+    .then(response => response.json())
+    .then(data => renderPicture(picture, data))
+    .catch(() => { picture.append(el("p", null, "Could not load the customer picture.")); });
   for (const hit of alert.hits) {
     const card = el("article", "hit " + hit.decision);
     const top = el("div", "hit-top");
@@ -626,6 +657,29 @@ function renderList() {
     btn.onclick = () => show(alert);
     list.append(btn);
   }
+}
+
+function renderPicture(host, data) {
+  host.replaceChildren();
+  host.append(el("h2", null, "Customer picture"));
+  if (!data || data.error) {
+    host.append(el("p", null, data && data.error ? data.error : "No picture."));
+    return;
+  }
+  host.append(el("p", null, data.link || ""));
+  (data.people || []).forEach(person => {
+    const block = el("div");
+    block.append(el("div", null, "Person " + person.seed_id + " (" + (person.record_ids || []).join(", ") + ")"));
+    (person.why || []).forEach(line => block.append(el("div", "meta", line)));
+    (person.records || []).forEach(record => {
+      block.append(el("div", null, record.record_id + " · " + record.name + (record.dob ? " · born " + record.dob : "") + (record.country ? " · " + record.country : "")));
+    });
+    (person.checks || []).forEach(check => {
+      block.append(el("div", null, check.check_id + " · " + check.result + (check.checked_at ? " · " + check.checked_at : "") + (check.verified_name ? " · " + check.verified_name : "")));
+      block.append(el("div", "meta", check.note || ""));
+    });
+    host.append(block);
+  });
 }
 
 function renderSteps(host, payload) {
@@ -810,6 +864,36 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   chip("DIFFERENT_ENTITY", "cleared", data.counts.DIFFERENT_ENTITY, "cleared");
   chip("SAME_ENTITY", "same", data.counts.SAME_ENTITY, "same person");
   chip("REVIEW", "review", data.counts.REVIEW, "review");
+  const workload = document.getElementById("workload");
+  const tally = {CLEARED: 0, ESCALATED: 0, ANALYST: 0};
+  const codes = {};
+  alerts.forEach(alert => { tally[alertStatus(alert)] += 1; });
+  alerts.forEach(alert => alert.hits.forEach(hit => { codes[hit.reason_code] = (codes[hit.reason_code] || 0) + 1; }));
+  function stat(number, label, key) {
+    const node = el("button", "count" + (alertFilter === key ? " active" : ""));
+    node.type = "button";
+    node.append(el("strong", null, String(number)));
+    node.append(document.createTextNode(label));
+    node.onclick = () => {
+      alertFilter = alertFilter === key ? "ALL" : key;
+      workload.querySelectorAll(".count").forEach(item => item.classList.remove("active"));
+      if (alertFilter !== "ALL") node.classList.add("active");
+      const rows = visible();
+      if (rows.length) show(rows[0]);
+      renderList();
+    };
+    workload.append(node);
+  }
+  stat(tally.CLEARED, "alerts cleared", "CLEARED");
+  stat(tally.ESCALATED, "escalated to compliance", "ESCALATED");
+  stat(tally.ANALYST, "need an analyst", "ANALYST");
+  const saved = el("div", "hint");
+  const minutes = tally.CLEARED * 8;
+  const hours = Math.round(minutes / 6) / 10;
+  const codeLine = Object.keys(codes).sort().map(code => code + " " + codes[code]).join(" · ");
+  saved.append(el("div", null, "Estimate: " + minutes + " minutes saved (" + hours + " hours), assuming 8 minutes of analyst time for each alert that can be closed without a person."));
+  saved.append(el("div", null, codeLine));
+  workload.append(saved);
   document.getElementById("q").addEventListener("input", renderList);
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
@@ -897,6 +981,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/practice":
             self._json(practice_report(self.labels, self.saved, live=False))
+            return
+        if parsed.path == "/api/picture":
+            alert_id = (parse_qs(parsed.query).get("alert_id") or [""])[0]
+            picture = self.world.customer_picture(alert_id)
+            self._json(picture, 404 if picture.get("error") else 200)
             return
         if parsed.path in ("/", "/index.html"):
             body = PAGE.encode("utf-8")
