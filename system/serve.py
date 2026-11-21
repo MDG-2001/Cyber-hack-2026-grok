@@ -133,7 +133,7 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Same person?</title>
+<title>Doppelgänger</title>
 <style>
   :root {
     --paper: #f3efe4;
@@ -156,25 +156,43 @@ PAGE = """<!DOCTYPE html>
     font: 16px/1.45 "Iowan Old Style", Palatino, Georgia, serif;
   }
   header {
-    padding: 22px 28px 16px;
+    padding: 18px 28px 16px;
     border-bottom: 1px solid var(--line);
     display: flex;
     justify-content: space-between;
-    gap: 16px;
+    gap: 20px;
     flex-wrap: wrap;
-    align-items: end;
+    align-items: center;
+    background: #faf7f1;
   }
-  h1 { font-size: 28px; font-weight: 600; margin: 0; letter-spacing: -0.03em; }
-  header p { margin: 4px 0 0; color: var(--muted); max-width: 46rem; }
+  .brand { display: flex; gap: 14px; align-items: center; }
+  .mark {
+    width: 42px; height: 42px; border-radius: 12px;
+    background: var(--ink); color: var(--paper);
+    display: grid; place-items: center;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-weight: 750; font-size: 18px; letter-spacing: -0.04em;
+  }
+  h1 { font-size: 26px; font-weight: 650; margin: 0; letter-spacing: -0.03em; }
+  header p { margin: 2px 0 0; color: var(--muted); }
   .counts { display: flex; gap: 8px; flex-wrap: wrap; }
   .count {
     background: var(--card);
     border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 6px 12px;
+    border-radius: 12px;
+    padding: 8px 12px;
     font-family: ui-sans-serif, system-ui, sans-serif;
     font-size: 13px;
+    cursor: pointer;
+    color: inherit;
+    text-align: left;
+    min-width: 92px;
   }
+  .count b { display: block; font-size: 18px; letter-spacing: -0.03em; }
+  .count.active { border-color: var(--ink); background: #fff; }
+  .count.cleared b { color: var(--cleared); }
+  .count.same b { color: var(--same); }
+  .count.review b { color: var(--review); }
   main { display: grid; grid-template-columns: 320px 1fr; min-height: calc(100vh - 92px); }
   aside { border-right: 1px solid var(--line); padding: 14px; }
   input {
@@ -186,7 +204,16 @@ PAGE = """<!DOCTYPE html>
     background: var(--card);
     color: var(--ink);
   }
-  #list { margin-top: 10px; max-height: calc(100vh - 170px); overflow: auto; }
+  .nav {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 8px; margin-top: 10px;
+    font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted);
+  }
+  .nav button {
+    border: 1px solid var(--line); background: var(--card); border-radius: 8px;
+    padding: 4px 10px; cursor: pointer; font: inherit; color: var(--ink);
+  }
+  #list { margin-top: 8px; max-height: calc(100vh - 230px); overflow: auto; }
   .alert-btn {
     width: 100%;
     text-align: left;
@@ -197,10 +224,22 @@ PAGE = """<!DOCTYPE html>
     cursor: pointer;
     color: inherit;
     font: inherit;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    align-items: center;
   }
   .alert-btn strong { display: block; font-size: 16px; }
   .alert-btn span { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
   .alert-btn.active, .alert-btn:hover { background: #fff; }
+  .mini {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 10px; font-weight: 750; letter-spacing: 0.04em;
+    text-transform: uppercase; border-radius: 999px; padding: 3px 7px; white-space: nowrap;
+  }
+  .mini.SAME_ENTITY { background: var(--same-bg); color: var(--same); }
+  .mini.REVIEW { background: var(--review-bg); color: var(--review); }
+  .mini.DIFFERENT_ENTITY { background: var(--cleared-bg); color: var(--cleared); }
   section { padding: 22px 28px 48px; }
   .screened {
     background: var(--card);
@@ -238,7 +277,12 @@ PAGE = """<!DOCTYPE html>
   .DIFFERENT_ENTITY .pill { background: var(--cleared-bg); color: var(--cleared); }
   .code { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
   .reason { margin: 8px 0 12px; }
-  .evidence { display: grid; gap: 8px; }
+  .evidence-label {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 8px;
+  }
+  .evidence { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .card {
     background: #faf7f1;
     border-radius: 10px;
@@ -258,15 +302,23 @@ PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div>
-    <h1>Same person?</h1>
-    <p>Each screening hit is cleared, confirmed, or left for an analyst. The note under a hit is the reason, and the cards are the records that decided it.</p>
+  <div class="brand">
+    <div class="mark">D</div>
+    <div>
+      <h1>Doppelgänger</h1>
+      <p>Is this hit the customer, or just the same name?</p>
+    </div>
   </div>
   <div class="counts" id="counts"></div>
 </header>
 <main>
   <aside>
     <input id="q" placeholder="Search a name, alert or hit" autocomplete="off">
+    <div class="nav">
+      <button id="prev" type="button">Previous</button>
+      <span id="pos">Alerts</span>
+      <button id="next" type="button">Next</button>
+    </div>
     <div id="list"></div>
   </aside>
   <section id="detail"><p class="empty">Loading the development set…</p></section>
@@ -279,6 +331,33 @@ const LABELS = {
 };
 let alerts = [];
 let current = null;
+let filter = "ALL";
+
+function headline(alert) {
+  if (alert.hits.some(hit => hit.decision === "SAME_ENTITY")) return "SAME_ENTITY";
+  if (alert.hits.some(hit => hit.decision === "REVIEW")) return "REVIEW";
+  return "DIFFERENT_ENTITY";
+}
+
+function visible() {
+  const query = document.getElementById("q").value.trim().toLowerCase();
+  return alerts.filter(alert => {
+    if (filter !== "ALL" && !alert.hits.some(hit => hit.decision === filter)) return false;
+    if (!query) return true;
+    const blob = [alert.alert_id, alert.name, alert.link, ...alert.hits.flatMap(hit => [hit.hit_id, hit.name, hit.decision, hit.reason_code])].join(" ").toLowerCase();
+    return blob.includes(query);
+  });
+}
+
+function step(delta) {
+  const rows = visible();
+  if (!rows.length) return;
+  let index = rows.findIndex(alert => alert.alert_id === current);
+  if (index < 0) index = 0;
+  show(rows[(index + delta + rows.length) % rows.length]);
+  const active = document.querySelector(".alert-btn.active");
+  if (active) active.scrollIntoView({block: "nearest"});
+}
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -289,6 +368,10 @@ function el(tag, className, text) {
 
 function show(alert) {
   current = alert.alert_id;
+  const rows = visible();
+  const index = rows.findIndex(item => item.alert_id === current);
+  const pos = document.getElementById("pos");
+  if (pos) pos.textContent = rows.length ? ((index < 0 ? 1 : index + 1) + " of " + rows.length) : "No alerts";
   document.querySelectorAll(".alert-btn").forEach(btn => {
     btn.classList.toggle("active", btn.dataset.id === alert.alert_id);
   });
@@ -312,6 +395,7 @@ function show(alert) {
     const record = hit.customer_record_id ? "Customer " + hit.customer_record_id : "No customer record";
     card.append(el("div", "code", hit.reason_code + " · " + record));
     card.append(el("p", "reason", hit.reason));
+    card.append(el("div", "evidence-label", "Evidence"));
     const evidence = el("div", "evidence");
     for (const item of hit.evidence) {
       const box = el("div", "card");
@@ -330,24 +414,25 @@ function show(alert) {
 }
 
 function renderList() {
-  const query = document.getElementById("q").value.trim().toLowerCase();
   const list = document.getElementById("list");
+  const rows = visible();
   list.replaceChildren();
-  const matches = alerts.filter(alert => {
-    if (!query) return true;
-    const blob = [alert.alert_id, alert.name, alert.link, ...alert.hits.flatMap(hit => [hit.hit_id, hit.name, hit.decision])].join(" ").toLowerCase();
-    return blob.includes(query);
-  }).slice(0, 80);
-  if (!matches.length) {
+  const index = rows.findIndex(alert => alert.alert_id === current);
+  document.getElementById("pos").textContent = rows.length ? ((index < 0 ? 1 : index + 1) + " of " + rows.length) : "No alerts";
+  if (!rows.length) {
     list.append(el("p", "empty", "Nothing matches that search."));
     return;
   }
-  for (const alert of matches) {
+  for (const alert of rows.slice(0, 120)) {
     const btn = el("button", "alert-btn" + (alert.alert_id === current ? " active" : ""));
     btn.dataset.id = alert.alert_id;
-    btn.append(el("strong", null, alert.name));
-    const decisions = alert.hits.map(hit => LABELS[hit.decision] || hit.decision).join(", ");
-    btn.append(el("span", null, alert.alert_id + " · " + decisions));
+    const text = el("div");
+    text.append(el("strong", null, alert.name));
+    const extra = alert.hits.length > 1 ? " · " + alert.hits.length + " hits" : "";
+    text.append(el("span", null, alert.alert_id + extra));
+    btn.append(text);
+    const kind = headline(alert);
+    btn.append(el("span", "mini " + kind, LABELS[kind]));
     btn.onclick = () => show(alert);
     list.append(btn);
   }
@@ -356,11 +441,33 @@ function renderList() {
 fetch("/api/bundle").then(r => r.json()).then(data => {
   alerts = data.alerts;
   const counts = document.getElementById("counts");
-  counts.append(el("div", "count", data.hits + " hits"));
-  counts.append(el("div", "count", data.counts.DIFFERENT_ENTITY + " cleared"));
-  counts.append(el("div", "count", data.counts.SAME_ENTITY + " same person"));
-  counts.append(el("div", "count", data.counts.REVIEW + " review"));
+  function chip(key, className, number, label) {
+    const button = el("button", "count" + (className ? " " + className : "") + (filter === key ? " active" : ""));
+    button.type = "button";
+    button.append(el("b", null, String(number)));
+    button.append(document.createTextNode(label));
+    button.onclick = () => {
+      filter = filter === key ? "ALL" : key;
+      counts.querySelectorAll(".count").forEach(node => node.classList.remove("active"));
+      if (filter !== "ALL") button.classList.add("active");
+      const rows = visible();
+      if (rows.length) show(rows[0]);
+      renderList();
+    };
+    counts.append(button);
+  }
+  chip("ALL", "", data.hits, "hits");
+  chip("DIFFERENT_ENTITY", "cleared", data.counts.DIFFERENT_ENTITY, "cleared");
+  chip("SAME_ENTITY", "same", data.counts.SAME_ENTITY, "same person");
+  chip("REVIEW", "review", data.counts.REVIEW, "review");
   document.getElementById("q").addEventListener("input", renderList);
+  document.getElementById("prev").onclick = () => step(-1);
+  document.getElementById("next").onclick = () => step(1);
+  document.addEventListener("keydown", event => {
+    if (event.target.tagName === "INPUT" || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") { event.preventDefault(); step(1); }
+    if (event.key === "ArrowUp" || event.key === "ArrowLeft") { event.preventDefault(); step(-1); }
+  });
   const params = new URLSearchParams(location.search);
   if (params.get("q")) document.getElementById("q").value = params.get("q");
   renderList();

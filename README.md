@@ -1,4 +1,6 @@
-# Same person?
+# Doppelgänger
+
+Is this hit the customer, or just the same name?
 
 A screening alert says a customer looks like someone on a sanctions, PEP or adverse-media list. Most of those hits are a different person with a similar name. This project decides, for every hit, whether the evidence shows the same person, a different one, or that an analyst still has to look.
 

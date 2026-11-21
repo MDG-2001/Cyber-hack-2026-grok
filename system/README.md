@@ -1,4 +1,8 @@
-# How the decision is made
+# Doppelgänger
+
+Is this hit the customer, or just the same name?
+
+## How the decision is made
 
 `system/run <data folder> <output file>` reads that folder and writes one JSON line per hit. If you pass the Google Sheets workbook instead of a folder, it converts the workbook first (same result as `python3 system/convert_xlsx.py`). Nothing is random and no model is called, so five runs produce the same decisions and the same reason codes. A development run takes a few seconds and costs nothing.
 
