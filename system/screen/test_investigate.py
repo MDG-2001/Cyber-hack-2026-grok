@@ -10,7 +10,7 @@ import os
 import unittest
 from urllib.error import HTTPError
 
-from screen.investigate import investigate
+from screen.investigate import investigate, select_provider
 from screen.test_adversarial import Case
 
 
@@ -60,7 +60,8 @@ class InvestigateTests(unittest.TestCase):
         os.environ["XAI_API_KEY"] = "test-key-not-real"
         result = investigate(world, "H-T001", transport=transport)
         self.assertTrue(result["live"])
-        self.assertEqual(result["source"], "grok")
+        self.assertEqual(result["source"], "xai")
+        self.assertNotIn("test-key-not-real", json.dumps(result))
         self.assertFalse(result["overrides_decision"])
         self.assertEqual(result["deterministic"]["decision"], "DIFFERENT_ENTITY")
         self.assertEqual(result["assessment"], "DIFFERENT_ENTITY")
@@ -90,6 +91,47 @@ class InvestigateTests(unittest.TestCase):
         self.assertEqual(result["error"], "malformed")
         self.assertFalse(result["overrides_decision"])
         self.assertEqual(result["deterministic"]["decision"], "SAME_ENTITY")
+
+
+class ProviderTests(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("XAI_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENROUTER_MODEL", None)
+
+    def test_openrouter_is_preferred_when_both_keys_exist(self):
+        os.environ["OPENROUTER_API_KEY"] = "router-secret"
+        os.environ["OPENROUTER_MODEL"] = "judge/model"
+        os.environ["XAI_API_KEY"] = "xai-secret"
+        provider = select_provider()
+        self.assertEqual(provider["name"], "openrouter")
+        self.assertEqual(provider["model"], "judge/model")
+        self.assertNotEqual(provider["key"], "xai-secret")
+
+    def test_xai_is_used_when_it_is_the_only_key(self):
+        os.environ["XAI_API_KEY"] = "xai-secret"
+        provider = select_provider()
+        self.assertEqual(provider["name"], "xai")
+        self.assertEqual(provider["model"], "grok-4")
+
+    def test_http_400_and_500_do_not_change_the_decision(self):
+        case = Case()
+        case.person("Ada Costa")
+        _outcome, world = case.decide()
+        os.environ["XAI_API_KEY"] = "xai-secret"
+
+        def fail(code):
+            def transport(model, packet, key):
+                raise HTTPError("https://example.test", code, "nope", hdrs=None, fp=None)
+            return transport
+
+        client = investigate(world, "H-T001", transport=fail(400))
+        server = investigate(world, "H-T001", transport=fail(503))
+        self.assertEqual(client["error"], "provider_client")
+        self.assertEqual(server["error"], "provider_server")
+        self.assertEqual(client["deterministic"]["decision"], "SAME_ENTITY")
+        self.assertFalse(client["overrides_decision"])
+        self.assertNotIn("xai-secret", json.dumps(client))
 
 
 if __name__ == "__main__":

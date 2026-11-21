@@ -1,8 +1,9 @@
-"""Optional Grok advisory. It never changes a screening decision.
+"""Optional model advisory. It never changes a screening decision.
 
-Set XAI_API_KEY to call the xAI API. Set XAI_MODEL to choose the model
-(the default is grok-4). With no key, the deterministic decision stands
-and this module reports that live AI was not run.
+OpenRouter is used when OPENROUTER_API_KEY is set (model: OPENROUTER_MODEL,
+default x-ai/grok-4). Otherwise XAI_API_KEY is used (model: XAI_MODEL, default
+grok-4). When both are set, OpenRouter is preferred. Keys stay in the
+environment: they are not returned to the browser and they are not logged.
 
 Documents inside the case are evidence, not instructions.
 """
@@ -12,11 +13,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
 
-API_URL = "https://api.x.ai/v1/chat/completions"
+XAI_URL = "https://api.x.ai/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "grok-4"
+DEFAULT_OPENROUTER_MODEL = "x-ai/grok-4"
 TIMEOUT_SECONDS = 25
 
 _INSTRUCTION = re.compile(
@@ -47,32 +51,40 @@ def investigate(world, hit_id: str, transport=None) -> dict:
         "hit_id": hit_id,
         "deterministic": deterministic,
     }
-    key = os.environ.get("XAI_API_KEY") or ""
-    if transport is None and not key.strip():
-        base["reason"] = "XAI_API_KEY is not set. Live Grok was not called. The screening decision is unchanged."
+    provider = select_provider()
+    if provider is None:
+        base["reason"] = (
+            "No API key is set. Set OPENROUTER_API_KEY or XAI_API_KEY. "
+            "Live AI was not called. The screening decision is unchanged."
+        )
         return base
     packet = _packet(brief)
     allowed = set(packet["allowed_evidence_ids"])
-    model = os.environ.get("XAI_MODEL") or DEFAULT_MODEL
+    model = provider["model"]
     try:
-        raw = (transport or _post)(model, packet, key)
-    except TimeoutError:
-        return _failure(base, "timeout", "The Grok request timed out. The screening decision is unchanged.")
+        if transport is None:
+            raw = _post(provider, packet)
+        else:
+            raw = transport(model, packet, provider["key"])
+    except (TimeoutError, socket.timeout):
+        return _failure(base, "timeout", "The model request timed out. The screening decision is unchanged.")
     except urllib.error.HTTPError as error:
         if error.code == 429:
-            return _failure(base, "rate_limited", "The Grok service rate-limited the request. The screening decision is unchanged.")
-        return _failure(base, "provider", f"The Grok service returned HTTP {error.code}. The screening decision is unchanged.")
+            return _failure(base, "rate_limited", "The model service rate-limited the request. The screening decision is unchanged.")
+        if 400 <= error.code < 500:
+            return _failure(base, "provider_client", f"The model service returned HTTP {error.code}. The screening decision is unchanged.")
+        return _failure(base, "provider_server", f"The model service returned HTTP {error.code}. The screening decision is unchanged.")
     except (urllib.error.URLError, OSError):
-        return _failure(base, "provider", "The Grok service could not be reached. The screening decision is unchanged.")
+        return _failure(base, "provider", "The model service could not be reached. The screening decision is unchanged.")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return _failure(base, "malformed", "Grok did not return JSON. The screening decision is unchanged.")
+        return _failure(base, "malformed", "The model did not return JSON. The screening decision is unchanged.")
     assessment = validate_assessment(parsed, allowed)
     assessment.update({
         "available": True,
         "live": True,
-        "source": "grok",
+        "source": provider["name"],
         "model": model,
         "overrides_decision": False,
         "advisory_only": True,
@@ -199,9 +211,30 @@ def _failure(base: dict, code: str, reason: str) -> dict:
     return failed
 
 
-def _post(model: str, packet: dict, key: str) -> str:
+def select_provider():
+    """OpenRouter wins when both keys are present. The key itself is not logged."""
+    openrouter = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    xai = (os.environ.get("XAI_API_KEY") or "").strip()
+    if openrouter:
+        return {
+            "name": "openrouter",
+            "key": openrouter,
+            "model": (os.environ.get("OPENROUTER_MODEL") or DEFAULT_OPENROUTER_MODEL).strip(),
+            "url": OPENROUTER_URL,
+        }
+    if xai:
+        return {
+            "name": "xai",
+            "key": xai,
+            "model": (os.environ.get("XAI_MODEL") or DEFAULT_MODEL).strip(),
+            "url": XAI_URL,
+        }
+    return None
+
+
+def _post(provider: dict, packet: dict) -> str:
     body = {
-        "model": model,
+        "model": provider["model"],
         "temperature": 0,
         "messages": [
             {
@@ -220,14 +253,16 @@ def _post(model: str, packet: dict, key: str) -> str:
         "response_format": {"type": "json_object"},
     }
     request = urllib.request.Request(
-        API_URL,
+        provider["url"],
         data=json.dumps(body).encode("utf-8"),
         headers={
-            "Authorization": "Bearer " + key,
+            "Authorization": "Bearer " + provider["key"],
             "Content-Type": "application/json",
         },
         method="POST",
     )
+    if provider["name"] == "openrouter":
+        request.add_header("X-Title", "Doppelganger")
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
