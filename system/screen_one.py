@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from screen.engine import World
+from screen.intake import screen_name_error
 
 
 def main():
@@ -34,6 +35,11 @@ def main():
 
         folder = tempfile.mkdtemp(prefix="screening-")
         convert(args.data, folder)
+    message = screen_name_error(args.name)
+    if message:
+        json.dump({"error": message}, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        sys.exit(2)
     world = World(folder)
     result = world.screen_customer({
         "customer_name": args.name,
