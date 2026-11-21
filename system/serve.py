@@ -124,6 +124,9 @@ def load_bundle(folder: str, output: str) -> dict:
                 "countries": as_list(hit.get("countries")) + as_list(hit.get("nationality")) + as_list(hit.get("citizenship")),
                 "entity_type": as_text(hit.get("entity_type")),
                 "categories": as_list(hit.get("categories")),
+                "primary_category": as_text(hit.get("primary_category")),
+                "sources": as_list(hit.get("sources")),
+                "position_or_allegation": as_text(hit.get("position_or_allegation")),
                 "decision": row["decision"],
                 "reason_code": row["reason_code"],
                 "customer_record_id": row.get("customer_record_id"),
@@ -339,7 +342,8 @@ PAGE = """<!DOCTYPE html>
     border: 1px solid var(--line); background: var(--card); border-radius: 8px;
     padding: 4px 10px; cursor: pointer; font: inherit; color: var(--ink);
   }
-  #list { margin-top: 8px; max-height: calc(100vh - 230px); overflow: auto; }
+  #list { margin-top: 8px; max-height: calc(100vh - 360px); overflow: auto; }
+  .alert-btn .list-badge { font-size: 10px; font-family: ui-sans-serif, system-ui, sans-serif; }
   .alert-btn {
     width: 100%;
     text-align: left;
@@ -366,6 +370,35 @@ PAGE = """<!DOCTYPE html>
   .mini.SAME_ENTITY { background: var(--same-bg); color: var(--same); }
   .mini.REVIEW { background: var(--review-bg); color: var(--review); }
   .mini.DIFFERENT_ENTITY { background: var(--cleared-bg); color: var(--cleared); }
+  .lists { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .list-badge, .list-chip, .source {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 10px; font-weight: 750; letter-spacing: 0.03em;
+    text-transform: uppercase; border-radius: 999px; padding: 3px 7px;
+    white-space: nowrap; border: 1px solid transparent;
+  }
+  .list-badge.sanctions, .list-chip.sanctions {
+    background: #6e1220; color: #fff; border-color: #6e1220;
+    font-size: 11px; padding: 4px 9px;
+  }
+  .list-badge.pep, .list-chip.pep { background: #e4e9f7; color: #24356b; }
+  .list-badge.adverse, .list-chip.adverse { background: #f4e3c4; color: #7a4b08; }
+  .list-badge.enforcement, .list-chip.enforcement { background: #efe4f6; color: #5b2a78; }
+  .list-badge.registration, .list-chip.registration { background: #d9f0ea; color: #0e5c4d; }
+  .list-badge.soe, .list-chip.soe { background: #e4e7ee; color: #243044; }
+  .list-badge.other, .list-chip.other { background: #eeeae4; color: #5c564e; }
+  .list-filters { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .list-chip { cursor: pointer; background: #fff; border-color: var(--line); color: var(--ink); text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 650; }
+  .list-chip.sanctions { text-transform: uppercase; }
+  .list-chip.active { box-shadow: 0 0 0 2px var(--ink); }
+  .filter-label { margin: 12px 0 0; }
+  .sources { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  .source {
+    text-transform: none; letter-spacing: 0; font-weight: 600; font-size: 12px;
+    background: #faf7f1; color: var(--ink); border-color: var(--line); border-radius: 8px;
+    white-space: normal;
+  }
+  .allegation { margin: 8px 0 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
   section { padding: 22px 28px 48px; }
   .screened {
     background: var(--card);
@@ -498,6 +531,8 @@ PAGE = """<!DOCTYPE html>
 <main id="layout">
   <aside id="browser">
     <input id="q" placeholder="Search a name, alert or hit" autocomplete="off">
+    <div class="meta filter-label">List type</div>
+    <div id="list-filters" class="list-filters"></div>
     <div class="nav">
       <button id="prev" type="button">Previous</button>
       <span id="pos">Alerts</span>
@@ -517,6 +552,74 @@ let alerts = [];
 let current = null;
 let filter = "ALL";
 let alertFilter = "ALL";
+let listFilter = "ALL";
+let paintListFilters = () => {};
+const LIST_ORDER = ["Sanctions", "PEP", "Adverse Media", "Enforcement", "Registration", "SOE", "Other Segment"];
+
+function listClass(name) {
+  const key = String(name || "").toLowerCase();
+  if (key === "sanctions") return "sanctions";
+  if (key === "pep") return "pep";
+  if (key === "adverse media") return "adverse";
+  if (key === "enforcement") return "enforcement";
+  if (key === "registration") return "registration";
+  if (key === "soe") return "soe";
+  return "other";
+}
+
+function hitLists(hit) {
+  const lists = [];
+  const primary = (hit.primary_category || "").trim();
+  if (primary) lists.push(primary);
+  (hit.categories || []).forEach(item => {
+    const name = String(item || "").trim();
+    if (name && !lists.includes(name)) lists.push(name);
+  });
+  return lists;
+}
+
+function sortLists(names) {
+  return names.slice().sort((a, b) => {
+    const ia = LIST_ORDER.indexOf(a);
+    const ib = LIST_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+  });
+}
+
+function listBadges(names) {
+  const row = el("div", "lists");
+  sortLists(names).forEach(name => row.append(el("span", "list-badge " + listClass(name), name)));
+  return row;
+}
+
+function watchlistSources(hit) {
+  if (Array.isArray(hit.list_sources)) return hit.list_sources.filter(Boolean);
+  const sources = hit.sources || [];
+  if (sources.length && typeof sources[0] === "string") return sources.filter(Boolean);
+  return [];
+}
+
+function appendListFacts(parent, hit) {
+  const lists = hitLists(hit);
+  if (lists.length) parent.append(listBadges(lists));
+  if (hit.position_or_allegation) parent.append(el("p", "allegation", hit.position_or_allegation));
+  const sources = watchlistSources(hit);
+  if (!sources.length) return;
+  parent.append(el("div", "evidence-label", "List sources"));
+  const row = el("div", "sources");
+  const paint = items => {
+    row.replaceChildren();
+    items.forEach(source => row.append(el("span", "source", source)));
+  };
+  paint(sources.length > 8 ? sources.slice(0, 8) : sources);
+  parent.append(row);
+  if (sources.length > 8) {
+    const more = el("button", "list-chip", "Show all " + sources.length + " sources");
+    more.type = "button";
+    more.onclick = () => { paint(sources); more.remove(); };
+    parent.append(more);
+  }
+}
 
 function alertStatus(alert) {
   if (alert.hits.some(hit => hit.decision === "SAME_ENTITY")) return "ESCALATED";
@@ -535,8 +638,9 @@ function visible() {
   return alerts.filter(alert => {
     if (alertFilter !== "ALL" && alertStatus(alert) !== alertFilter) return false;
     if (filter !== "ALL" && !alert.hits.some(hit => hit.decision === filter)) return false;
+    if (listFilter !== "ALL" && !alert.hits.some(hit => hitLists(hit).includes(listFilter))) return false;
     if (!query) return true;
-    const blob = [alert.alert_id, alert.name, alert.link, ...alert.hits.flatMap(hit => [hit.hit_id, hit.name, hit.decision, hit.reason_code])].join(" ").toLowerCase();
+    const blob = [alert.alert_id, alert.name, alert.link, ...alert.hits.flatMap(hit => [hit.hit_id, hit.name, hit.decision, hit.reason_code, hit.primary_category, ...(hit.categories || []), ...(watchlistSources(hit))])].join(" ").toLowerCase();
     return blob.includes(query);
   });
 }
@@ -575,6 +679,8 @@ function homeAlert() {
 function goHome(fromPop) {
   filter = "ALL";
   alertFilter = "ALL";
+  listFilter = "ALL";
+  paintListFilters();
   const search = document.getElementById("q");
   if (search) search.value = "";
   document.querySelectorAll("#counts .count").forEach(node => {
@@ -597,6 +703,8 @@ function applyLocation() {
   const params = new URLSearchParams(location.search);
   filter = "ALL";
   alertFilter = "ALL";
+  listFilter = "ALL";
+  paintListFilters();
   const search = document.getElementById("q");
   if (search) search.value = params.get("q") || "";
   document.querySelectorAll("#counts .count, #workload .count").forEach(node => node.classList.remove("active"));
@@ -652,7 +760,9 @@ function show(alert) {
     const top = el("div", "hit-top");
     const who = el("div");
     who.append(el("strong", null, hit.name));
-    who.append(el("div", "meta", [hit.hit_id, hit.entity_type, (hit.categories || []).join(", ")].filter(Boolean).join(" · ")));
+    const lists = hitLists(hit);
+    if (lists.length) who.append(listBadges(lists));
+    who.append(el("div", "meta", [hit.hit_id, hit.entity_type].filter(Boolean).join(" · ")));
     top.append(who);
     top.append(el("span", "pill", LABELS[hit.decision] || hit.decision));
     card.append(top);
@@ -667,10 +777,28 @@ function show(alert) {
     right.append(el("h3", null, "Listed profile"));
     right.append(el("div", null, hit.name));
     const alias = (hit.aliases || []).length ? "Also known as " + hit.aliases.join(", ") : "";
-    const listed = [hit.entity_type, (hit.categories || []).join(", "), (hit.dobs || []).join(", "), (hit.countries || []).join(", "), alias].filter(Boolean).join(" · ");
+    const listed = [hit.entity_type, (hit.dobs || []).join(", "), (hit.countries || []).join(", "), alias].filter(Boolean).join(" · ");
     right.append(el("div", null, listed || "No further list details"));
     compare.append(left, right);
     card.append(compare);
+    if (hit.position_or_allegation) card.append(el("p", "allegation", hit.position_or_allegation));
+    const sources = watchlistSources(hit);
+    if (sources.length) {
+      card.append(el("div", "evidence-label", "List sources"));
+      const row = el("div", "sources");
+      const paint = items => {
+        row.replaceChildren();
+        items.forEach(source => row.append(el("span", "source", source)));
+      };
+      paint(sources.length > 8 ? sources.slice(0, 8) : sources);
+      card.append(row);
+      if (sources.length > 8) {
+        const more = el("button", "list-chip", "Show all " + sources.length + " sources");
+        more.type = "button";
+        more.onclick = () => { paint(sources); more.remove(); };
+        card.append(more);
+      }
+    }
     if (hit.customer_record_id === "AMBIGUOUS") {
       card.append(el("div", "ambiguous", "More than one customer fits this alert. Run the decision to see how many, and whether they all lead to the same verdict."));
     }
@@ -716,6 +844,9 @@ function renderList() {
     text.append(el("strong", null, alert.name));
     const extra = alert.hits.length > 1 ? " · " + alert.hits.length + " hits" : "";
     text.append(el("span", null, alert.alert_id + extra));
+    const names = [];
+    alert.hits.forEach(hit => hitLists(hit).forEach(name => { if (!names.includes(name)) names.push(name); }));
+    if (names.length) text.append(listBadges(names));
     btn.append(text);
     const kind = headline(alert);
     btn.append(el("span", "mini " + kind, LABELS[kind]));
@@ -873,6 +1004,7 @@ function showScreenResult(host, payload) {
   (payload.candidates || []).forEach((candidate, index) => {
     const card = el("article", "hit " + candidate.decision);
     card.append(el("strong", null, candidate.name + " · " + candidate.hit_id));
+    appendListFacts(card, candidate);
     card.append(el("div", "meta", candidate.why + " · " + candidate.reason_code));
     card.append(el("p", "reason", candidate.reason));
     if ((candidate.sources || []).length) {
@@ -1021,7 +1153,11 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   const tally = {CLEARED: 0, ESCALATED: 0, ANALYST: 0};
   const codes = {};
   alerts.forEach(alert => { tally[alertStatus(alert)] += 1; });
-  alerts.forEach(alert => alert.hits.forEach(hit => { codes[hit.reason_code] = (codes[hit.reason_code] || 0) + 1; }));
+  const listCounts = {};
+  alerts.forEach(alert => alert.hits.forEach(hit => {
+    codes[hit.reason_code] = (codes[hit.reason_code] || 0) + 1;
+    hitLists(hit).forEach(name => { listCounts[name] = (listCounts[name] || 0) + 1; });
+  }));
   function stat(number, label, key) {
     const node = el("button", "count" + (alertFilter === key ? " active" : ""));
     node.type = "button";
@@ -1046,7 +1182,42 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   const codeLine = Object.keys(codes).sort().map(code => code + " " + codes[code]).join(" · ");
   saved.append(el("div", null, "Estimate: " + minutes + " minutes saved (" + hours + " hours), assuming 8 minutes of analyst time for each alert that can be closed without a person."));
   saved.append(el("div", null, codeLine));
+  const breakdown = el("div", "lists");
+  sortLists(Object.keys(listCounts)).forEach(name => {
+    breakdown.append(el("span", "list-badge " + listClass(name), name + " " + listCounts[name]));
+  });
+  saved.append(el("div", null, "Hits by list type. A hit on more than one list is counted in each."));
+  saved.append(breakdown);
+  saved.append(el("div", null, "List type is shown for context only. Per the brief, decisions are about identity, not severity, so every list is treated the same."));
   workload.append(saved);
+  paintListFilters = () => {
+    const host = document.getElementById("list-filters");
+    if (!host) return;
+    host.replaceChildren();
+    const all = el("button", "list-chip" + (listFilter === "ALL" ? " active" : ""), "All lists");
+    all.type = "button";
+    all.onclick = () => {
+      listFilter = "ALL";
+      paintListFilters();
+      const rows = visible();
+      if (rows.length) show(rows[0]);
+      renderList();
+    };
+    host.append(all);
+    sortLists(Object.keys(listCounts)).forEach(name => {
+      const button = el("button", "list-chip " + listClass(name) + (listFilter === name ? " active" : ""), name + " " + listCounts[name]);
+      button.type = "button";
+      button.onclick = () => {
+        listFilter = listFilter === name ? "ALL" : name;
+        paintListFilters();
+        const rows = visible();
+        if (rows.length) show(rows[0]);
+        renderList();
+      };
+      host.append(button);
+    });
+  };
+  paintListFilters();
   document.getElementById("q").addEventListener("input", renderList);
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
@@ -1162,7 +1333,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self._trace(self.world.explain_entered(payload)))
             return
         if parsed.path == "/api/screen":
-            self._json(self.world.screen_customer(payload))
+            result = self.world.screen_customer(payload)
+            for candidate in result.get("candidates") or []:
+                hit = self.world.hits.get(candidate.get("hit_id")) or {}
+                candidate["categories"] = as_list(hit.get("categories"))
+                candidate["primary_category"] = as_text(hit.get("primary_category"))
+                candidate["list_sources"] = as_list(hit.get("sources"))
+                candidate["position_or_allegation"] = as_text(hit.get("position_or_allegation"))
+            self._json(result)
             return
         if parsed.path == "/api/practice/run":
             live = {}

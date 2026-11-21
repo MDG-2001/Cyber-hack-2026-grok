@@ -63,6 +63,8 @@ A person is confirmed when the name and the date of birth agree and nothing cont
 
 The evidence list is only the records that decided the hit: the customer records, the identity check or note, and a search result when the date came from one. It is not everything the pipeline opened.
 
+The list type on a profile (sanctions, PEP, adverse media, and the rest) is shown on the review page for context only. Per the brief, decisions are about identity, not severity, so the engine treats every list the same.
+
 ## Determinism, model, and cost
 
 No model and no prompts. The rules are fixed code, so two runs write the same bytes. A development run takes about 4 seconds on this machine and costs nothing. An alert is cleared only when every hit is `DIFFERENT_ENTITY`. One `SAME_ENTITY` escalates the alert to compliance. Anything else still needs an analyst.
