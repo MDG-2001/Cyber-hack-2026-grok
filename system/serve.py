@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from screen.engine import World
 
 PORT = 8766
 
@@ -114,6 +119,9 @@ def load_bundle(folder: str, output: str) -> dict:
             {
                 "hit_id": row["hit_id"],
                 "name": as_text(hit.get("name")) or row["hit_id"],
+                "aliases": as_list(hit.get("aliases")),
+                "dobs": as_list(hit.get("dobs")),
+                "countries": as_list(hit.get("countries")) + as_list(hit.get("nationality")) + as_list(hit.get("citizenship")),
                 "entity_type": as_text(hit.get("entity_type")),
                 "categories": as_list(hit.get("categories")),
                 "decision": row["decision"],
@@ -150,7 +158,96 @@ def load_bundle(folder: str, output: str) -> dict:
     counts = {"DIFFERENT_ENTITY": 0, "SAME_ENTITY": 0, "REVIEW": 0}
     for row in predictions:
         counts[row["decision"]] = counts.get(row["decision"], 0) + 1
-    return {"alerts": alerts_out, "counts": counts, "hits": len(predictions)}
+    return {
+        "alerts": alerts_out,
+        "counts": counts,
+        "hits": len(predictions),
+        "demos": demo_picks(predictions),
+        "has_practice": os.path.exists(os.path.join(folder, "practice_labels.jsonl")),
+    }
+
+
+def demo_picks(predictions):
+    """Three alerts worth showing in three minutes, chosen from the saved file."""
+    picks = []
+    same = next((row for row in predictions if row.get("reason_code") == "NAME_DOB_LOCATION_MATCH"), None)
+    review = next((row for row in predictions if row.get("decision") == "REVIEW"), None)
+    widest = None
+    gap = -1
+    for row in predictions:
+        if row.get("reason_code") != "DOB_MISMATCH":
+            continue
+        years = [int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", row.get("reason") or "")]
+        if len(years) < 2:
+            continue
+        width = max(years) - min(years)
+        if width > gap:
+            gap = width
+            widest = row
+    if widest:
+        picks.append({
+            "label": "Large date gap",
+            "alert_id": widest["alert_id"],
+            "hit_id": widest["hit_id"],
+            "blurb": "Cleared because the birth dates are " + str(gap) + " years apart",
+        })
+    if same:
+        picks.append({
+            "label": "Same person",
+            "alert_id": same["alert_id"],
+            "hit_id": same["hit_id"],
+            "blurb": "Name, date of birth and country all agree",
+        })
+    if review:
+        picks.append({
+            "label": "Needs review",
+            "alert_id": review["alert_id"],
+            "hit_id": review["hit_id"],
+            "blurb": "Nothing contradicts the hit, and nothing confirms it",
+        })
+    return picks
+
+
+COST = {
+    "DIFFERENT_ENTITY": {"DIFFERENT_ENTITY": 0, "SAME_ENTITY": 3, "REVIEW": 3},
+    "SAME_ENTITY": {"DIFFERENT_ENTITY": 60, "SAME_ENTITY": 0, "REVIEW": 2},
+    "REVIEW": {"DIFFERENT_ENTITY": 60, "SAME_ENTITY": 2, "REVIEW": 0},
+}
+
+
+def practice_report(labels, answers, live=False):
+    rows = []
+    for label in labels:
+        answer = answers.get(label["hit_id"], {})
+        expected = label.get("decision")
+        got = answer.get("decision")
+        codes = label.get("reason_codes") or []
+        code_ok = answer.get("reason_code") in codes
+        rows.append({
+            "hit_id": label["hit_id"],
+            "alert_id": label.get("alert_id") or answer.get("alert_id"),
+            "expected": expected,
+            "got": got,
+            "match": got == expected,
+            "expected_codes": codes,
+            "got_code": answer.get("reason_code"),
+            "code_ok": code_ok,
+            "unsafe": expected != "DIFFERENT_ENTITY" and got == "DIFFERENT_ENTITY",
+        })
+    cost = sum(COST[row["expected"]][row["got"] or "REVIEW"] for row in rows if row["expected"] in COST)
+    baseline = sum(COST[row["expected"]]["REVIEW"] for row in rows if row["expected"] in COST)
+    right = [row for row in rows if row["match"]]
+    unsafe = sum(1 for row in rows if row["unsafe"])
+    score = 100 * max(0.0, 1 - cost / baseline) if baseline else 100.0
+    return {
+        "total": len(rows),
+        "right": len(right),
+        "unsafe": unsafe,
+        "score": round(score, 1),
+        "code_ok": sum(1 for row in right if row["code_ok"]),
+        "live": live,
+        "rows": rows,
+    }
 
 
 PAGE = """<!DOCTYPE html>
@@ -318,10 +415,48 @@ PAGE = """<!DOCTYPE html>
   .card b { font-family: ui-monospace, monospace; font-size: 12px; }
   .card .kind { color: var(--muted); font-size: 12px; }
   .empty { color: var(--muted); padding: 24px 4px; }
+  .toolbar {
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 10px 28px; border-bottom: 1px solid var(--line); background: var(--paper);
+  }
+  .modes, .demos { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .modes button, .demos button, .run, .try button {
+    border: 1px solid var(--line); background: #fff; border-radius: 999px;
+    padding: 6px 12px; cursor: pointer;
+    font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; color: var(--ink);
+  }
+  .modes button.active, .run { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0 4px; }
+  .compare > div { background: #faf7f1; border-radius: 10px; padding: 10px 12px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
+  .compare h3 { margin: 0 0 6px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .ambiguous { background: var(--review-bg); color: var(--review); border-radius: 10px; padding: 8px 12px; margin: 8px 0; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
+  .trace { margin-top: 8px; }
+  .step {
+    border: 1px solid var(--line); border-left: 5px solid var(--muted); border-radius: 10px;
+    padding: 8px 12px; margin: 8px 0; background: #fff;
+    opacity: 0; transform: translateY(8px);
+    animation: rise .4s ease forwards;
+  }
+  .step.pass { border-left-color: var(--cleared); }
+  .step.contradiction { border-left-color: var(--same); }
+  .step.unknown { border-left-color: var(--review); }
+  .step b { font-family: ui-sans-serif, system-ui, sans-serif; }
+  .vs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+  .tick { color: var(--cleared); font-weight: 700; }
+  .cross { color: var(--same); font-weight: 700; }
+  .scorehead { font-family: ui-sans-serif, system-ui, sans-serif; }
+  table.score { width: 100%; border-collapse: collapse; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; background: #fff; }
+  table.score th, table.score td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  form.try label { display: block; margin: 10px 0 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+  form.try input, form.try select { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: 15px ui-sans-serif, system-ui, sans-serif; }
+  main.single { grid-template-columns: 1fr; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
   @media (max-width: 800px) {
     main { grid-template-columns: 1fr; }
     aside { border-right: 0; border-bottom: 1px solid var(--line); }
     #list { max-height: 240px; }
+    .compare, .vs, .pair { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -336,8 +471,16 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div class="counts" id="counts"></div>
 </header>
-<main>
-  <aside>
+<div class="toolbar">
+  <div class="modes">
+    <button type="button" id="mode-alerts" class="active">Alerts</button>
+    <button type="button" id="mode-answers">Test against answers</button>
+    <button type="button" id="mode-try">Try your own</button>
+  </div>
+  <div class="demos" id="demos"></div>
+</div>
+<main id="layout">
+  <aside id="browser">
     <input id="q" placeholder="Search a name, alert or hit" autocomplete="off">
     <div class="nav">
       <button id="prev" type="button">Previous</button>
@@ -419,6 +562,28 @@ function show(alert) {
     card.append(top);
     const record = hit.customer_record_id ? "Customer " + hit.customer_record_id : "No customer record";
     card.append(el("div", "code", hit.reason_code + " · " + record));
+    const compare = el("div", "compare");
+    const left = el("div");
+    left.append(el("h3", null, "Customer, as screened"));
+    left.append(el("div", null, alert.name));
+    left.append(el("div", null, [alert.entity_type, alert.dob, alert.country, alert.city].filter(Boolean).join(" · ") || "No further screened details"));
+    const right = el("div");
+    right.append(el("h3", null, "Listed profile"));
+    right.append(el("div", null, hit.name));
+    const alias = (hit.aliases || []).length ? "Also known as " + hit.aliases.join(", ") : "";
+    const listed = [hit.entity_type, (hit.categories || []).join(", "), (hit.dobs || []).join(", "), (hit.countries || []).join(", "), alias].filter(Boolean).join(" · ");
+    right.append(el("div", null, listed || "No further list details"));
+    compare.append(left, right);
+    card.append(compare);
+    if (hit.customer_record_id === "AMBIGUOUS") {
+      card.append(el("div", "ambiguous", "More than one customer fits this alert. Run the decision to see how many, and whether they all lead to the same verdict."));
+    }
+    const run = el("button", "run", "Run decision");
+    run.type = "button";
+    run.onclick = () => runHit(hit.hit_id, trace);
+    card.append(run);
+    const trace = el("div", "trace");
+    card.append(trace);
     card.append(el("p", "reason", hit.reason));
     card.append(el("div", "evidence-label", "Evidence"));
     const evidence = el("div", "evidence");
@@ -463,6 +628,166 @@ function renderList() {
   }
 }
 
+function renderSteps(host, payload) {
+  host.replaceChildren();
+  (payload.steps || []).forEach((step, index) => {
+    const box = el("div", "step " + (step.status || "unknown"));
+    box.style.animationDelay = (index * 0.12) + "s";
+    const title = el("div");
+    title.append(el("b", null, step.title || "Step"));
+    title.append(document.createTextNode(" · " + (step.status || "")));
+    box.append(title);
+    if (step.customer || step.hit) {
+      const vs = el("div", "vs");
+      const left = el("div");
+      left.append(el("div", "meta", "Customer"));
+      left.append(el("div", null, step.customer || ""));
+      const right = el("div");
+      right.append(el("div", "meta", "Hit"));
+      right.append(el("div", null, step.hit || ""));
+      vs.append(left, right);
+      box.append(vs);
+    }
+    if (step.detail) box.append(el("div", null, step.detail));
+    host.append(box);
+  });
+  if (payload.matches_saved === true) {
+    host.append(el("div", "tick", "Matches the saved output."));
+  } else if (payload.matches_saved === false) {
+    host.append(el("div", "cross", "Does not match the saved output."));
+  }
+}
+
+function runHit(hitId, host) {
+  host.replaceChildren(el("div", "meta", "Running the same rules on this hit…"));
+  fetch("/api/trace?hit_id=" + encodeURIComponent(hitId))
+    .then(response => response.json())
+    .then(payload => renderSteps(host, payload))
+    .catch(() => host.replaceChildren(el("div", "cross", "The live run failed.")));
+}
+
+function setMode(mode) {
+  document.getElementById("layout").classList.toggle("single", mode !== "alerts");
+  document.getElementById("browser").style.display = mode === "alerts" ? "" : "none";
+  ["alerts", "answers", "try"].forEach(name => {
+    document.getElementById("mode-" + name).classList.toggle("active", name === mode);
+  });
+  if (mode === "alerts") {
+    renderList();
+    const alert = alerts.find(item => item.alert_id === current);
+    if (alert) show(alert);
+    return;
+  }
+  const root = document.getElementById("detail");
+  root.replaceChildren(el("p", "empty", "Loading…"));
+  if (mode === "answers") loadAnswers(false);
+  if (mode === "try") showTry();
+}
+
+function loadAnswers(live) {
+  const root = document.getElementById("detail");
+  const url = live ? "/api/practice/run" : "/api/practice";
+  const options = live ? {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"} : {};
+  fetch(url, options).then(response => response.json()).then(report => {
+    root.replaceChildren();
+    const head = el("div", "screened scorehead");
+    head.append(el("h2", null, report.right + " / " + report.total + " practice decisions"));
+    head.append(el("p", null, "Score " + report.score + ". Unsafe clearances: " + report.unsafe + ". Reason code agrees on " + report.code_ok + " of the right decisions." + (report.live ? " Recomputed live." : " Compared with the saved file.")));
+    const button = el("button", "run", report.live ? "Run all again" : "Run all");
+    button.type = "button";
+    button.onclick = () => loadAnswers(true);
+    head.append(button);
+    root.append(head);
+    if (!report.total) {
+      root.append(el("p", "empty", "This data folder has no practice_labels.jsonl."));
+      return;
+    }
+    const table = document.createElement("table");
+    table.className = "score";
+    const header = document.createElement("tr");
+    ["Hit", "Expected", "Ours", "Reason code", ""].forEach(label => header.append(el("th", null, label)));
+    table.append(header);
+    report.rows.forEach(row => {
+      const tr = document.createElement("tr");
+      const link = el("button", null, row.hit_id);
+      link.type = "button";
+      link.onclick = () => { setMode("alerts"); const alert = alerts.find(item => item.alert_id === row.alert_id); if (alert) show(alert); };
+      const cell = document.createElement("td");
+      cell.append(link);
+      tr.append(cell);
+      tr.append(el("td", null, row.expected || ""));
+      tr.append(el("td", null, row.got || "missing"));
+      tr.append(el("td", null, (row.got_code || "") + (row.code_ok ? "" : " (differs)")));
+      tr.append(el("td", row.match ? "tick" : "cross", row.match ? "Match" : (row.unsafe ? "Unsafe clear" : "Miss")));
+      table.append(tr);
+    });
+    root.append(table);
+  }).catch(() => root.replaceChildren(el("p", "cross", "Could not score the practice labels.")));
+}
+
+function field(form, label, name, value) {
+  form.append(el("label", null, label));
+  const input = document.createElement("input");
+  input.name = name;
+  input.value = value || "";
+  form.append(input);
+}
+
+function showTry() {
+  const root = document.getElementById("detail");
+  root.replaceChildren();
+  root.append(el("h2", null, "Try your own"));
+  root.append(el("p", "meta", "Same rules as a real hit. Nothing here is written into the saved file."));
+  const form = el("form", "try");
+  const pair = el("div", "pair");
+  const customer = el("div");
+  customer.append(el("h3", null, "Customer"));
+  field(customer, "Name", "customer_name", "John Doe");
+  customer.append(el("label", null, "Type"));
+  const customerType = document.createElement("select");
+  customerType.name = "customer_type";
+  ["Individual", "Company"].forEach(option => {
+    const node = el("option", null, option);
+    node.value = option;
+    customerType.append(node);
+  });
+  customer.append(customerType);
+  field(customer, "Date of birth or year", "customer_dob", "1990-05-12");
+  field(customer, "Countries or nationalities", "customer_countries", "British");
+  const listed = el("div");
+  listed.append(el("h3", null, "Listed profile"));
+  field(listed, "Name", "hit_name", "Jon Doe");
+  field(listed, "Aliases, separated by commas", "hit_aliases", "");
+  listed.append(el("label", null, "Type"));
+  const hitType = document.createElement("select");
+  hitType.name = "hit_type";
+  ["Individual", "Company"].forEach(option => {
+    const node = el("option", null, option);
+    node.value = option;
+    hitType.append(node);
+  });
+  listed.append(hitType);
+  field(listed, "Dates of birth or years", "hit_dobs", "1969-05-12");
+  field(listed, "Countries", "hit_countries", "Belarus");
+  field(listed, "List type (optional)", "list_type", "Sanctions");
+  pair.append(customer, listed);
+  form.append(pair);
+  const button = el("button", "run", "Run decision");
+  button.type = "submit";
+  form.append(button);
+  const host = el("div", "trace");
+  form.onsubmit = event => {
+    event.preventDefault();
+    const body = {};
+    new FormData(form).forEach((value, key) => { body[key] = value; });
+    host.replaceChildren(el("div", "meta", "Running…"));
+    fetch("/api/try", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})
+      .then(response => response.json())
+      .then(payload => renderSteps(host, payload));
+  };
+  root.append(form, host);
+}
+
 fetch("/api/bundle").then(r => r.json()).then(data => {
   alerts = data.alerts;
   const counts = document.getElementById("counts");
@@ -488,6 +813,20 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   document.getElementById("q").addEventListener("input", renderList);
   document.getElementById("prev").onclick = () => step(-1);
   document.getElementById("next").onclick = () => step(1);
+  document.getElementById("mode-alerts").onclick = () => setMode("alerts");
+  document.getElementById("mode-answers").onclick = () => setMode("answers");
+  document.getElementById("mode-try").onclick = () => setMode("try");
+  (data.demos || []).forEach(demo => {
+    const button = el("button", null, demo.label);
+    button.type = "button";
+    button.title = demo.blurb || "";
+    button.onclick = () => {
+      setMode("alerts");
+      const alert = alerts.find(item => item.alert_id === demo.alert_id);
+      if (alert) show(alert);
+    };
+    document.getElementById("demos").append(button);
+  });
   document.addEventListener("keydown", event => {
     if (event.target.tagName === "INPUT" || event.metaKey || event.ctrlKey || event.altKey) return;
     if (event.key === "ArrowDown" || event.key === "ArrowRight") { event.preventDefault(); step(1); }
@@ -510,20 +849,56 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
 
 class Handler(BaseHTTPRequestHandler):
     bundle = {}
+    world = None
+    saved = {}
+    labels = []
 
     def log_message(self, fmt, *args):
         return
 
+    def _json(self, payload, status=200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _trace(self, explained):
+        saved = self.saved.get(explained.get("hit_id") or "")
+        if saved:
+            explained["saved"] = {
+                "decision": saved.get("decision"),
+                "reason_code": saved.get("reason_code"),
+                "customer_record_id": saved.get("customer_record_id"),
+            }
+            explained["matches_saved"] = (
+                saved.get("decision") == explained.get("decision")
+                and saved.get("reason_code") == explained.get("reason_code")
+                and (saved.get("customer_record_id") or None) == (explained.get("customer_record_id") or None)
+            )
+        else:
+            explained["saved"] = None
+            explained["matches_saved"] = None
+        return explained
+
     def do_GET(self):
-        if self.path.split("?")[0] == "/api/bundle":
-            body = json.dumps(self.bundle).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/bundle":
+            self._json(self.bundle)
             return
-        if self.path.split("?")[0] in ("/", "/index.html"):
+        if parsed.path == "/api/trace":
+            hit_id = (parse_qs(parsed.query).get("hit_id") or [""])[0]
+            explained = self.world.explain_hit(hit_id)
+            if explained.get("error"):
+                self._json(explained, 404)
+                return
+            self._json(self._trace(explained))
+            return
+        if parsed.path == "/api/practice":
+            self._json(practice_report(self.labels, self.saved, live=False))
+            return
+        if parsed.path in ("/", "/index.html"):
             body = PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -533,12 +908,49 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._json({"error": "Body was not JSON"}, 400)
+            return
+        if parsed.path == "/api/try":
+            self._json(self._trace(self.world.explain_entered(payload)))
+            return
+        if parsed.path == "/api/practice/run":
+            live = {}
+            for label in self.labels:
+                hit = self.world.hits.get(label["hit_id"])
+                alert = self.world.alerts.get(label.get("alert_id") or (hit or {}).get("alert_id"))
+                if hit is None or alert is None:
+                    continue
+                outcome = self.world.decide_hit(alert, hit)
+                live[label["hit_id"]] = {
+                    "hit_id": label["hit_id"],
+                    "alert_id": hit["alert_id"],
+                    "decision": outcome.decision,
+                    "reason_code": outcome.reason_code,
+                    "customer_record_id": outcome.customer_record_id,
+                }
+            self._json(practice_report(self.labels, live, live=True))
+            return
+        self.send_error(404)
+
 
 def main():
     if len(sys.argv) != 3:
         print("usage: python3 system/serve.py <data folder> <output file>", file=sys.stderr)
         sys.exit(2)
-    Handler.bundle = load_bundle(sys.argv[1], sys.argv[2])
+    folder, output = sys.argv[1], sys.argv[2]
+    Handler.bundle = load_bundle(folder, output)
+    Handler.saved = {row["hit_id"]: row for row in read_jsonl(output)}
+    practice_path = os.path.join(folder, "practice_labels.jsonl")
+    Handler.labels = read_jsonl(practice_path) if os.path.exists(practice_path) else []
+    print(f"Loading the decision engine for live traces ({Handler.bundle['hits']} hits)...")
+    Handler.world = World(folder)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Demo at http://127.0.0.1:{PORT}  ({Handler.bundle['hits']} hits)")
     server.serve_forever()

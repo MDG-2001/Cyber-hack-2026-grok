@@ -556,7 +556,8 @@ class World:
             death=parse_when(hit.get("deceased_date")),
         )
 
-    def judge(self, alert: dict, hit: dict, party: Party) -> Outcome:
+    def _compare(self, alert: dict, hit: dict, party: Party) -> dict:
+        """The checks judge() uses, in one place, so a trace cannot drift from the verdict."""
         facts = self.hit_facts(hit)
         customer_kind = "company" if party.company else "person"
         hit_kind = "company" if facts.company else "person"
@@ -590,10 +591,7 @@ class World:
                 verified_display = display
         usable = True
         if customer_kind == "person":
-            if party.verified_name:
-                usable = any(len(tokens) >= 2 for tokens in customer_tokens)
-            else:
-                usable = any(len(tokens) >= 2 for tokens in customer_tokens)
+            usable = any(len(tokens) >= 2 for tokens in customer_tokens)
         hit_token_sets = [self.names.tokens(name, company=facts.company) for name in facts.names]
         if usable:
             for tokens in customer_tokens:
@@ -609,8 +607,52 @@ class World:
         location_mismatch = bool(party.countries and facts.countries and not overlap)
         # A country difference does not clear a hit whose name and date of birth agree.
         location_clears = location_mismatch and not (name_agrees and dob_agrees)
+        return {
+            "facts": facts,
+            "customer_kind": customer_kind,
+            "hit_kind": hit_kind,
+            "type_mismatch": type_mismatch,
+            "screened_at": screened_at,
+            "deceased": deceased,
+            "temporal": temporal,
+            "temporal_age": temporal_age,
+            "temporal_on": temporal_on,
+            "name_agrees": name_agrees,
+            "name_source": name_source,
+            "verified_display": verified_display,
+            "usable": usable,
+            "name_mismatch": name_mismatch,
+            "dob_agrees": dob_agrees,
+            "dob_mismatch": dob_mismatch,
+            "overlap": overlap,
+            "location_agree": location_agree,
+            "location_mismatch": location_mismatch,
+            "location_clears": location_clears,
+            "hit_name": hit.get("name") or "the listed name",
+        }
 
-        hit_name = hit.get("name") or "the listed name"
+    def judge(self, alert: dict, hit: dict, party: Party) -> Outcome:
+        compared = self._compare(alert, hit, party)
+        facts = compared["facts"]
+        customer_kind = compared["customer_kind"]
+        hit_kind = compared["hit_kind"]
+        type_mismatch = compared["type_mismatch"]
+        screened_at = compared["screened_at"]
+        deceased = compared["deceased"]
+        temporal = compared["temporal"]
+        temporal_age = compared["temporal_age"]
+        temporal_on = compared["temporal_on"]
+        name_agrees = compared["name_agrees"]
+        name_source = compared["name_source"]
+        verified_display = compared["verified_display"]
+        name_mismatch = compared["name_mismatch"]
+        dob_agrees = compared["dob_agrees"]
+        dob_mismatch = compared["dob_mismatch"]
+        overlap = compared["overlap"]
+        location_agree = compared["location_agree"]
+        location_mismatch = compared["location_mismatch"]
+        location_clears = compared["location_clears"]
+        hit_name = compared["hit_name"]
         if type_mismatch:
             code = "ENTITY_TYPE_MISMATCH"
             decision = "DIFFERENT_ENTITY"
@@ -840,6 +882,318 @@ class World:
         if len(facts.births) == 1:
             return f"the hit's listed date of birth is {label}"
         return f"the hit's listed dates of birth are {label}"
+
+    def describe_link(self, alert: dict, parties: list) -> str:
+        """How the alert was tied to customer records. Does not choose the records."""
+        if alert.get("_entered"):
+            return "These details were typed into Try your own. They are not a customer in the bank's files."
+        if alert.get("account_ref"):
+            holders = [
+                row["customer_id"]
+                for row in self.accounts_by_id.get(alert["account_ref"], [])
+                if row.get("customer_id")
+            ]
+            opener = f"Account {alert['account_ref']} is held by {', '.join(holders) or 'no one in the file'}."
+        elif alert.get("login_handle"):
+            owner = self.login_to_customer.get(alert["login_handle"])
+            opener = f"Login {alert['login_handle']} belongs to {owner or 'no account'}."
+        elif alert.get("email"):
+            found = self.by_email.get(str(alert["email"]).lower(), [])
+            opener = f"Email {alert['email']} matches {len(found)} customer record(s)."
+        else:
+            screened = alert.get("customer") or {}
+            opener = (
+                "The alert has no account, login or email, so the screened name, date of birth, "
+                f"country and city were searched: {screened.get('name') or 'unknown name'}"
+                f", born {screened.get('dob') or 'unknown'}"
+                f", {screened.get('country') or 'unknown country'}"
+                + (f", {screened.get('city')}" if screened.get("city") else "")
+                + "."
+            )
+        if not parties:
+            return opener + " No customer record fits, so the hit cannot be confirmed or cleared."
+        if len(parties) == 1:
+            party = parties[0]
+            extra = ""
+            if len(party.record_ids) > 1:
+                extra = (
+                    " Same person on more than one record ("
+                    + ", ".join(party.record_ids)
+                    + "), linked by a shared phone and full date of birth or by the same document number."
+                )
+            return opener + f" Resolved to {party.seed_id}." + extra
+        return (
+            opener
+            + f" {len(parties)} possible customers fit: "
+            + ", ".join(party.seed_id for party in parties)
+            + "."
+        )
+
+    def _steps(self, alert: dict, hit: dict, parties: list, outcome: Outcome) -> list:
+        compared = [self._compare(alert, hit, party) for party in parties] if parties else []
+
+        def values(key, empty="not on file"):
+            bits = []
+            for party, item in zip(parties, compared):
+                bits.append(f"{party.seed_id}: {key(party, item)}")
+            return "; ".join(bits) if bits else empty
+
+        steps = []
+        link = self.describe_link(alert, parties)
+        if len(parties) > 1 and outcome.decision == "DIFFERENT_ENTITY":
+            link += f" {len(parties)} possible customers, all contradicted, so cleared."
+        elif len(parties) > 1 and outcome.customer_record_id == "AMBIGUOUS":
+            link += " Each possible customer is decided on its own."
+        steps.append({"title": "Customer link", "status": "pass" if parties else "unknown", "detail": link})
+
+        if parties:
+            identity_bits = []
+            for party in parties:
+                if party.identity and (party.identity.name or party.identity.dob):
+                    born = party.identity.dob.label() if party.identity.dob else "no date"
+                    country = party.identity.document_country or "no document country"
+                    identity_bits.append(
+                        f"{party.seed_id}: {party.identity.name or 'no verified name'}, born {born}, "
+                        f"document {country} ({party.identity.source_id})"
+                    )
+                else:
+                    identity_bits.append(f"{party.seed_id}: no approved identity check, so the customer record is used")
+            steps.append({
+                "title": "Verified identity",
+                "status": "pass",
+                "detail": " ".join(identity_bits),
+            })
+
+        def check(title, status, customer, hit_value, detail):
+            steps.append({
+                "title": title,
+                "status": status,
+                "customer": customer,
+                "hit": hit_value,
+                "detail": detail,
+            })
+
+        if compared:
+            name_status = "unknown"
+            if any(item["name_mismatch"] for item in compared):
+                name_status = "contradiction"
+            elif any(item["name_agrees"] for item in compared) and not any(item["name_mismatch"] for item in compared):
+                name_status = "pass"
+            names = values(lambda party, item: item["verified_display"] or "no usable name")
+            hit_names = ", ".join(compared[0]["facts"].names) or "no name"
+            if name_status == "pass":
+                name_detail = "The names agree under the bank's name rules."
+            elif name_status == "contradiction":
+                name_detail = "The verified legal name agrees with none of the hit's names."
+            else:
+                name_detail = "Not enough of a name to confirm or to clear."
+            check("Name", name_status, names, hit_names, name_detail)
+
+            dob_status = "unknown"
+            if any(item["dob_mismatch"] for item in compared) and not any(item["dob_agrees"] for item in compared):
+                dob_status = "contradiction"
+            elif any(item["dob_agrees"] for item in compared) and not any(item["dob_mismatch"] for item in compared):
+                dob_status = "pass"
+            elif any(item["dob_agrees"] for item in compared) and any(item["dob_mismatch"] for item in compared):
+                dob_status = "unknown"
+            dob_customer = values(
+                lambda party, item: party.dob.label() if party.dob else "no date of birth"
+            )
+            hit_dob = self._hit_birth_label(compared[0]["facts"]) if compared[0]["facts"].births else "no date of birth"
+            origin = compared[0]["facts"].birth_origin
+            if dob_status == "contradiction":
+                dob_detail = "Every date the hit gives is contradicted."
+            elif dob_status == "pass":
+                dob_detail = "A date of birth agrees, including a year on its own with a full date."
+            else:
+                dob_detail = "The dates cannot be compared, or they are only a year apart."
+            if origin:
+                dob_detail += f" Hit date source: {origin}."
+            check("Date of birth", dob_status, dob_customer, hit_dob, dob_detail)
+
+            time_status = "unknown"
+            time_detail = "The hit has no dated report in the form the policy counts, and no date of death before screening."
+            if any(item["deceased"] or item["temporal"] for item in compared):
+                time_status = "contradiction"
+                time_detail = "The customer could not have been the listed person at the date in the profile."
+            elif compared[0]["facts"].reports and any(party.dob is not None for party in parties):
+                time_status = "pass"
+                time_detail = "Dated reports exist, and the customer is old enough (or the company already existed)."
+            check(
+                "Time",
+                time_status,
+                values(lambda party, item: party.dob.label() if party.dob else "no date"),
+                ", ".join(item.label() for item in compared[0]["facts"].reports) or (
+                    compared[0]["facts"].death.label() if compared[0]["facts"].death else "no dated report"
+                ),
+                time_detail,
+            )
+
+            if any(item["location_mismatch"] for item in compared) and not any(item["location_agree"] for item in compared):
+                loc_status = "contradiction"
+                loc_detail = "Every country on the customer differs from every country on the hit."
+                if any(item["name_agrees"] and item["dob_agrees"] for item in compared):
+                    loc_detail += " Name and date of birth agree, so this difference does not clear the hit."
+            elif any(item["location_agree"] for item in compared):
+                loc_status = "pass"
+                loc_detail = "At least one country is shared."
+            else:
+                loc_status = "unknown"
+                loc_detail = "One side has no country, so location cannot confirm or clear."
+            check(
+                "Location",
+                loc_status,
+                values(lambda party, item: joined(party.countries) or "no country"),
+                joined(compared[0]["facts"].countries) or "no country",
+                loc_detail,
+            )
+
+            if any(item["type_mismatch"] for item in compared):
+                type_status, type_detail = "contradiction", "One side is a person and the other is a company."
+            else:
+                type_status, type_detail = "pass", "Both sides are the same kind of entity."
+            check(
+                "Type",
+                type_status,
+                values(lambda party, item: item["customer_kind"]),
+                compared[0]["hit_kind"],
+                type_detail,
+            )
+
+        verdict = {
+            "DIFFERENT_ENTITY": "Cleared",
+            "SAME_ENTITY": "Same person",
+            "REVIEW": "Review",
+        }.get(outcome.decision, outcome.decision)
+        steps.append({
+            "title": "Verdict",
+            "status": "contradiction" if outcome.decision == "DIFFERENT_ENTITY" else (
+                "pass" if outcome.decision == "SAME_ENTITY" else "unknown"
+            ),
+            "detail": f"{verdict}. {outcome.reason_code}. {outcome.reason}",
+            "customer": outcome.customer_record_id or "no customer record",
+            "hit": hit.get("name") or "",
+        })
+        return steps
+
+    def explain_hit(self, hit_id: str) -> dict:
+        hit = self.hits.get(hit_id)
+        if hit is None:
+            return {"error": f"Unknown hit {hit_id}"}
+        alert = self.alerts.get(hit["alert_id"])
+        if alert is None:
+            outcome = Outcome("REVIEW", "INSUFFICIENT_DATA", "This hit has no alert.", [hit_id], None)
+            parties = []
+        else:
+            parties = self.resolve(alert)
+            outcome = self.decide_hit(alert, hit)
+        return self._explain_payload(alert or {"customer": {}}, hit, parties, outcome)
+
+    def explain_entered(self, payload: dict) -> dict:
+        """A customer and a list profile typed into the form, judged by the same rules."""
+        customer_name = (payload.get("customer_name") or "").strip()
+        customer_type = payload.get("customer_type") or "Individual"
+        customer_dob = parse_when(payload.get("customer_dob"))
+        customer_countries = set()
+        for part in str(payload.get("customer_countries") or "").replace(";", ",").split(","):
+            country = canon(part.strip())
+            if country:
+                customer_countries.add(country)
+        hit_name = (payload.get("hit_name") or "").strip() or "Unknown"
+        aliases = [
+            part.strip()
+            for part in str(payload.get("hit_aliases") or "").replace(";", ",").split(",")
+            if part.strip()
+        ]
+        hit_dobs = [
+            part.strip()
+            for part in str(payload.get("hit_dobs") or "").replace(";", ",").split(",")
+            if part.strip()
+        ]
+        hit_countries = []
+        for part in str(payload.get("hit_countries") or "").replace(";", ",").split(","):
+            country = canon(part.strip())
+            if country:
+                hit_countries.append(country)
+        hit_type = payload.get("hit_type") or "Individual"
+        company = is_company(customer_type)
+        party = Party(
+            record_ids=["ENTERED"],
+            seed_id="ENTERED",
+            company=company,
+            identity=Identity(
+                source_id="entered",
+                name=customer_name or None,
+                dob=customer_dob,
+                document_country=next(iter(sorted(customer_countries)), None),
+                when="",
+            ),
+            names=[(customer_name, "entered")] if customer_name else [],
+            verified_name=bool(customer_name),
+            dob=customer_dob,
+            dob_source_id="entered" if customer_dob else None,
+            countries=customer_countries,
+            country_sources={country: {"entered"} for country in customer_countries},
+        )
+        alert = {
+            "_entered": True,
+            "alert_id": "ENTERED",
+            "screened_at": "2026-11-21",
+            "customer": {
+                "name": customer_name,
+                "entity_type": "Company" if company else "Individual",
+                "dob": payload.get("customer_dob") or None,
+                "country": next(iter(sorted(customer_countries)), None),
+                "city": None,
+            },
+            "account_ref": None,
+            "login_handle": None,
+            "email": None,
+            "hit_ids": ["ENTERED"],
+        }
+        hit = {
+            "hit_id": "ENTERED",
+            "alert_id": "ENTERED",
+            "entity_type": "Company" if is_company(hit_type) else "Individual",
+            "name": hit_name,
+            "aliases": aliases,
+            "dobs": hit_dobs,
+            "countries": hit_countries,
+            "nationality": [],
+            "citizenship": [],
+            "addresses": [],
+            "place_of_birth": None,
+            "categories": [payload.get("list_type")] if payload.get("list_type") else [],
+            "primary_category": payload.get("list_type") or None,
+            "profile_notes": None,
+            "deceased_date": None,
+            "best_matching_name": None,
+            "first_name": None,
+            "middle_name": None,
+            "last_name": None,
+        }
+        outcome = self.judge(alert, hit, party)
+        return self._explain_payload(alert, hit, [party], outcome)
+
+    def _explain_payload(self, alert, hit, parties, outcome: Outcome) -> dict:
+        return {
+            "hit_id": hit.get("hit_id"),
+            "alert_id": hit.get("alert_id"),
+            "decision": outcome.decision,
+            "reason_code": outcome.reason_code,
+            "customer_record_id": outcome.customer_record_id,
+            "reason": outcome.reason,
+            "evidence": outcome.evidence,
+            "steps": self._steps(alert, hit, parties, outcome),
+            "hit_profile": {
+                "name": hit.get("name") or "",
+                "aliases": hit.get("aliases") or [],
+                "dobs": hit.get("dobs") or [],
+                "countries": sorted(hit_countries(hit)),
+                "entity_type": hit.get("entity_type") or "",
+                "categories": hit.get("categories") or [],
+            },
+        }
 
     def decide_hit(self, alert: dict, hit: dict) -> Outcome:
         parties = self.resolve(alert)

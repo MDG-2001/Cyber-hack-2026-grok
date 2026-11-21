@@ -45,6 +45,16 @@ A person is confirmed when the name and the date of birth agree and nothing cont
 
 The evidence list is only the records that decided the hit: the customer records, the identity check or note, and a search result when the date came from one. It is not everything the pipeline opened.
 
+## The review page
+
+`python3 system/serve.py <data folder> output/dev.jsonl` loads this same engine. Run decision, Test against answers and Try your own all call it, so a live result matches the saved file. Demo picks on the development set:
+
+- Large date gap: alert `A-499A43`, hit `H-03F7A2` (born 2002 against a 1945 listing).
+- Same person: alert `A-957E63`, hit `H-0181BD` (Marcos Costa, Brazil).
+- Needs review: alert `A-438429`, hit `H-008282` (Faruk Umar, Nigeria, no date of birth to compare).
+
+Alert `A-0059CE` is the ambiguous one: three Martin Austin Kaalund records, all contradicted, so the hit is cleared.
+
 ## Three cases
 
 **Cleared.** Hit `H-8E4EC8`. The customer is linked only to the Netherlands and the hit only to the United States. Reason code `LOCATION_MISMATCH`.

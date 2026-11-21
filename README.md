@@ -43,6 +43,8 @@ python3 system/serve.py data output/dev.jsonl
 
 Open http://127.0.0.1:8766 in a browser. Leave the last command running while you look.
 
+The page is the live demo. **Demo picks** jumps to one clear, one match and one review. **Run decision** replays that hit step by step. **Test against answers** scores the 50 practice labels. **Try your own** is filled in with John Doe, born 1990, against Jon Doe, born 1969, which clears on the date of birth.
+
 `system/run` also accepts the spreadsheet directly, and converts it for you:
 
 ```bash
