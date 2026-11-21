@@ -1,0 +1,11 @@
+# The screening workbook and the dev JSONL folder are for event participants.
+# Keep them on disk, outside the repo. Predictions in output/ are meant to be committed.
+/data/
+/dev/
+*.xlsx
+*.xls
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
