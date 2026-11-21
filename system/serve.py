@@ -27,6 +27,23 @@ def read_jsonl(path):
     return rows
 
 
+def as_text(value):
+    """Display text. A converted workbook can store one field as a string or a list."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(part for part in (as_text(item) for item in value) if part)
+    return str(value).strip()
+
+
+def as_list(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [as_text(item) for item in value if as_text(item)]
+    return [as_text(value)]
+
+
 def load_bundle(folder: str, output: str) -> dict:
     alerts = {row["alert_id"]: row for row in read_jsonl(os.path.join(folder, "alerts.jsonl"))}
     hits = {row["hit_id"]: row for row in read_jsonl(os.path.join(folder, "hits.jsonl"))}
@@ -36,16 +53,17 @@ def load_bundle(folder: str, output: str) -> dict:
     for row in read_jsonl(os.path.join(folder, "customers.jsonl")):
         customers[row["record_id"]] = {
             "kind": "Customer record",
-            "title": row.get("full_name") or row["record_id"],
+            "title": as_text(row.get("full_name")) or row["record_id"],
             "lines": [
-                row.get("entity_type") or "",
-                f"Born {row.get('dob')}" if row.get("dob") else "",
+                as_text(row.get("entity_type")),
+                ("Born " + as_text(row.get("dob"))) if as_text(row.get("dob")) else "",
                 ", ".join(
                     part
                     for part in (
-                        row.get("nationality"),
-                        row.get("residence_country"),
-                        row.get("city"),
+                        as_text(row.get("nationality")),
+                        as_text(row.get("residence_country")),
+                        as_text(row.get("city")),
+                        as_text(row.get("address")),
                     )
                     if part
                 ),
@@ -53,28 +71,35 @@ def load_bundle(folder: str, output: str) -> dict:
         }
     checks = {}
     for row in read_jsonl(os.path.join(folder, "kyc_checks.jsonl")):
+        checked = " ".join(
+            part
+            for part in (as_text(row.get("result")), as_text(row.get("checked_at")))
+            if part
+        )
         checks[row["check_id"]] = {
             "kind": "Identity check",
-            "title": row.get("verified_name") or row["check_id"],
+            "title": as_text(row.get("verified_name")) or row["check_id"],
             "lines": [
-                f"{row.get('result')} {row.get('checked_at') or ''}".strip(),
-                f"Born {row.get('verified_dob')}" if row.get("verified_dob") else "",
-                f"Document country {row.get('document_country')}" if row.get("document_country") else "",
+                checked,
+                ("Born " + as_text(row.get("verified_dob"))) if as_text(row.get("verified_dob")) else "",
+                ("Document " + as_text(row.get("document_type"))) if as_text(row.get("document_type")) else "",
+                ("Document country " + as_text(row.get("document_country"))) if as_text(row.get("document_country")) else "",
+                ("Number " + as_text(row.get("document_number"))) if as_text(row.get("document_number")) else "",
             ],
         }
     notes = {}
     for row in read_jsonl(os.path.join(folder, "notes.jsonl")):
         notes[row["note_id"]] = {
-            "kind": f"Note · {row.get('channel') or 'note'}",
-            "title": "",
-            "lines": [row.get("text") or ""],
+            "kind": "Note · " + (as_text(row.get("channel")) or "note"),
+            "title": as_text(row.get("created_at")),
+            "lines": [as_text(row.get("text"))],
         }
     searches = {}
     for row in read_jsonl(os.path.join(folder, "search_results.jsonl")):
         searches[row["result_id"]] = {
             "kind": "Search result",
-            "title": row.get("title") or row["result_id"],
-            "lines": [row.get("snippet") or ""],
+            "title": as_text(row.get("title")) or row["result_id"],
+            "lines": [as_text(row.get("snippet")), as_text(row.get("query"))],
         }
     records = {}
     records.update(customers)
@@ -88,9 +113,9 @@ def load_bundle(folder: str, output: str) -> dict:
         by_alert[row["alert_id"]].append(
             {
                 "hit_id": row["hit_id"],
-                "name": hit.get("name") or row["hit_id"],
-                "entity_type": hit.get("entity_type") or "",
-                "categories": hit.get("categories") or [],
+                "name": as_text(hit.get("name")) or row["hit_id"],
+                "entity_type": as_text(hit.get("entity_type")),
+                "categories": as_list(hit.get("categories")),
                 "decision": row["decision"],
                 "reason_code": row["reason_code"],
                 "customer_record_id": row.get("customer_record_id"),
@@ -111,13 +136,13 @@ def load_bundle(folder: str, output: str) -> dict:
         alerts_out.append(
             {
                 "alert_id": alert_id,
-                "screened_at": alert.get("screened_at"),
-                "name": screened.get("name") or alert_id,
-                "entity_type": screened.get("entity_type") or "",
-                "dob": screened.get("dob"),
-                "country": screened.get("country"),
-                "city": screened.get("city"),
-                "link": alert.get("account_ref") or alert.get("login_handle") or alert.get("email"),
+                "screened_at": as_text(alert.get("screened_at")),
+                "name": as_text(screened.get("name")) or alert_id,
+                "entity_type": as_text(screened.get("entity_type")),
+                "dob": as_text(screened.get("dob")),
+                "country": as_text(screened.get("country")),
+                "city": as_text(screened.get("city")),
+                "link": as_text(alert.get("account_ref") or alert.get("login_handle") or alert.get("email")),
                 "hits": alert_hits,
             }
         )

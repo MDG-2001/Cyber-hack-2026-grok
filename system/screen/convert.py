@@ -190,7 +190,8 @@ def convert(workbook_path: str, folder: str) -> dict:
     _write_jsonl(os.path.join(folder, "search_results.jsonl"), searches)
 
     policy = _sheet(workbook, "Policy")
-    policy_values = [row[0] for row in policy.iter_rows(values_only=True)]
+    # Empty rows in a Google Sheets export are empty tuples, not (None,).
+    policy_values = [row[0] if row else None for row in policy.iter_rows(values_only=True)]
     variants = _variants(policy_values)
     with open(os.path.join(folder, "name_variants.json"), "w", encoding="utf-8") as handle:
         json.dump(variants, handle, ensure_ascii=False, indent=2)
