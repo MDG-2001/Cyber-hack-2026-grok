@@ -65,6 +65,10 @@ The evidence list is only the records that decided the hit: the customer records
 
 The list type on a profile (sanctions, PEP, adverse media, and the rest) is shown on the review page for context only. Per the brief, decisions are about identity, not severity, so the engine treats every list the same.
 
+## Optional Grok advisory
+
+`POST /api/investigate` with `{"hit_id": "H-..."}` asks Grok for an advisory on that hit. It does not change the screening decision and it does not rewrite `output/dev.jsonl`. Set `XAI_API_KEY` to enable it, and `XAI_MODEL` if you do not want the default `grok-4`. With no key, the endpoint says live Grok was not called. Text inside customer notes and search snippets is treated as evidence, not as instructions. A claim that cites an evidence id from outside the case is rejected.
+
 ## Determinism, model, and cost
 
 No model and no prompts. The rules are fixed code, so two runs write the same bytes. A development run takes about 4 seconds on this machine and costs nothing. An alert is cleared only when every hit is `DIFFERENT_ENTITY`. One `SAME_ENTITY` escalates the alert to compliance. Anything else still needs an analyst.

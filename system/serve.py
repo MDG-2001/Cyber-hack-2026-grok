@@ -18,7 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from screen.brief import build_brief
 from screen.engine import World
+from screen.investigate import investigate
 
 PORT = 8766
 
@@ -399,6 +401,18 @@ PAGE = """<!DOCTYPE html>
     white-space: normal;
   }
   .allegation { margin: 8px 0 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
+  .brief { margin-top: 12px; }
+  .brief h3 { margin: 14px 0 6px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; }
+  .fact-row, .contra-row, .missing-row { border-left: 4px solid var(--line); padding: 6px 10px; margin: 6px 0; background: #faf7f1; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; }
+  .fact-row { border-left-color: var(--cleared); }
+  .contra-row { border-left-color: var(--same); }
+  .missing-row { border-left-color: var(--review); }
+  .advisory { border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; margin-top: 10px; background: #fff; }
+  .tag { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 10px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; margin-right: 6px; }
+  .tag.verified { color: var(--cleared); }
+  .tag.interpretation { color: var(--review); }
+  .tag.unsupported { color: var(--same); }
+  .record-link { background: none; border: 0; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; }
   section { padding: 22px 28px 48px; }
   .screened {
     background: var(--card);
@@ -823,8 +837,126 @@ function show(alert) {
       evidence.append(box);
     }
     card.append(evidence);
+    const briefHost = el("div", "brief");
+    briefHost.append(el("p", "meta", "Loading the case brief…"));
+    card.append(briefHost);
+    fetch("/api/brief?hit_id=" + encodeURIComponent(hit.hit_id))
+      .then(response => response.json())
+      .then(data => renderBrief(briefHost, data))
+      .catch(() => { briefHost.replaceChildren(el("p", "cross", "The case brief could not be loaded.")); });
     root.append(card);
   }
+}
+
+function renderBrief(host, data) {
+  host.replaceChildren();
+  if (!data || data.error) {
+    host.append(el("p", null, data && data.error ? data.error : "No case brief."));
+    return;
+  }
+  const decision = data.deterministic || {};
+  host.append(el("h3", null, "Screening result"));
+  host.append(el("div", null, (LABELS[decision.decision] || decision.decision || "") + (decision.reason_code ? " · " + decision.reason_code : "")));
+  host.append(el("p", "reason", decision.reason || ""));
+  host.append(el("h3", null, "Verified customer"));
+  (data.customer || []).forEach(person => {
+    const line = [person.verified_name || "No verified legal name", person.date_of_birth ? "born " + person.date_of_birth : "no date of birth", (person.countries || []).join(", ")].filter(Boolean).join(" · ");
+    host.append(el("div", "fact-row", line));
+    if (person.verified_from) host.append(el("div", "meta", "Verified from " + person.verified_from + ". Rejected and expired checks are not used."));
+  });
+  if (!(data.customer || []).length) host.append(el("div", "missing-row", "No customer record was resolved."));
+  const watch = data.watchlist || {};
+  host.append(el("h3", null, "Watchlist candidate"));
+  host.append(el("div", "fact-row", [watch.name, watch.entity_type, (watch.dobs || []).join(", "), (watch.countries || []).join(", "), watch.list_type].filter(Boolean).join(" · ")));
+  host.append(el("h3", null, "Supporting evidence"));
+  renderClaims(host, data.supporting, "fact-row", "Nothing in the records supports a match.");
+  host.append(el("h3", null, "Contradicting evidence"));
+  renderClaims(host, data.contradicting, "contra-row", "Nothing in the records contradicts the hit.");
+  host.append(el("h3", null, "Missing information"));
+  if ((data.missing || []).length) data.missing.forEach(line => host.append(el("div", "missing-row", line)));
+  else host.append(el("div", "meta", "No gap was recorded."));
+  if ((data.review_reasons || []).length) {
+    host.append(el("h3", null, "Why a person still has to look"));
+    data.review_reasons.forEach(line => host.append(el("div", "missing-row", line)));
+  }
+  host.append(el("h3", null, "Original records"));
+  (data.records || []).forEach(record => {
+    const box = el("div", "card");
+    box.append(el("div", "kind", record.kind || "Record"));
+    const title = el("div");
+    const button = el("button", "record-link", record.id);
+    button.type = "button";
+    const body = el("div", null, record.text || "No text stored for this id.");
+    body.hidden = true;
+    button.onclick = () => { body.hidden = !body.hidden; };
+    title.append(button, document.createTextNode("  " + (record.title || "")));
+    box.append(title, body);
+    host.append(box);
+  });
+  const advisory = el("div", "advisory");
+  advisory.append(el("h3", null, "Grok advisory"));
+  advisory.append(el("p", "meta", "This is an advisory. It does not change the screening decision. A live answer is labelled Grok. If the key is missing, nothing is invented."));
+  const button = el("button", "run", "Request advisory");
+  button.type = "button";
+  const result = el("div");
+  button.onclick = () => {
+    result.replaceChildren(el("div", "meta", "Asking Grok. The screening decision will not change."));
+    fetch("/api/investigate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({hit_id: data.hit_id})})
+      .then(response => response.json())
+      .then(payload => renderAdvisory(result, payload))
+      .catch(() => result.replaceChildren(el("div", "cross", "The advisory request failed. The screening decision is unchanged.")));
+  };
+  advisory.append(button, result);
+  host.append(advisory);
+}
+
+function renderClaims(host, claims, className, empty) {
+  if (!(claims || []).length) {
+    host.append(el("div", "meta", empty));
+    return;
+  }
+  claims.forEach(claim => {
+    const row = el("div", className);
+    row.append(el("span", "tag verified", "Verified fact"));
+    row.append(document.createTextNode(claim.fact || ""));
+    if ((claim.evidence_ids || []).length) row.append(el("div", "meta", claim.evidence_ids.join(", ")));
+    host.append(row);
+  });
+}
+
+function renderAdvisory(host, payload) {
+  host.replaceChildren();
+  if (!payload) return;
+  if (!payload.live) {
+    host.append(el("div", "missing-row", payload.reason || payload.error || "Live Grok was not called."));
+    host.append(el("div", "meta", "Source: " + (payload.source || "unavailable") + ". Screening decision: " + ((payload.deterministic || {}).decision || "unchanged") + "."));
+    return;
+  }
+  host.append(el("div", null, ""));
+  const banner = el("div", "fact-row");
+  banner.append(el("span", "tag interpretation", "Grok advisory"));
+  banner.append(document.createTextNode((payload.assessment || "UNCERTAIN") + " · model " + (payload.model || "")));
+  host.append(banner);
+  host.append(el("p", "meta", "Advisory only. The screening decision stays " + ((payload.deterministic || {}).decision || "as saved") + "."));
+  (payload.supports || []).forEach(claim => host.append(advisoryClaim(claim, "fact-row")));
+  (payload.contradicts || []).forEach(claim => host.append(advisoryClaim(claim, "contra-row")));
+  (payload.missing || []).forEach(line => host.append(el("div", "missing-row", line)));
+  (payload.next_checks || []).forEach(line => host.append(el("div", "meta", "Check next: " + line)));
+  (payload.uncertain || []).forEach(line => {
+    const row = el("div", "missing-row");
+    row.append(el("span", "tag unsupported", "Unsupported"));
+    row.append(document.createTextNode(line));
+    host.append(row);
+  });
+}
+
+function advisoryClaim(claim, className) {
+  const row = el("div", className);
+  const unsupported = claim.kind === "unsupported" || !(claim.evidence_ids || []).length;
+  row.append(el("span", "tag " + (unsupported ? "unsupported" : "interpretation"), unsupported ? "Unsupported" : "Model reading"));
+  row.append(document.createTextNode(claim.statement || ""));
+  if ((claim.evidence_ids || []).length) row.append(el("div", "meta", claim.evidence_ids.join(", ")));
+  return row;
 }
 
 function renderList() {
@@ -1310,6 +1442,11 @@ class Handler(BaseHTTPRequestHandler):
             picture = self.world.customer_picture(alert_id)
             self._json(picture, 404 if picture.get("error") else 200)
             return
+        if parsed.path == "/api/brief":
+            hit_id = (parse_qs(parsed.query).get("hit_id") or [""])[0]
+            brief = build_brief(self.world, hit_id)
+            self._json(brief, 404 if brief.get("error") else 200)
+            return
         if parsed.path in ("/", "/index.html"):
             body = PAGE.encode("utf-8")
             self.send_response(200)
@@ -1341,6 +1478,13 @@ class Handler(BaseHTTPRequestHandler):
                 candidate["list_sources"] = as_list(hit.get("sources"))
                 candidate["position_or_allegation"] = as_text(hit.get("position_or_allegation"))
             self._json(result)
+            return
+        if parsed.path == "/api/investigate":
+            if length > 10000:
+                self._json({"available": False, "live": False, "source": "error", "error": "too_large", "overrides_decision": False, "reason": "The request was too large. The screening decision is unchanged."}, 413)
+                return
+            hit_id = str(payload.get("hit_id") or "")
+            self._json(investigate(self.world, hit_id))
             return
         if parsed.path == "/api/practice/run":
             live = {}
