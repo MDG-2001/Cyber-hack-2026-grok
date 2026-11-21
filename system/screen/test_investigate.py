@@ -129,6 +129,12 @@ class ProviderTests(unittest.TestCase):
         server = investigate(world, "H-T001", transport=fail(503))
         self.assertEqual(client["error"], "provider_client")
         self.assertEqual(server["error"], "provider_server")
+        self.assertTrue(client["reason"].startswith("xAI "))
+        self.assertTrue(server["reason"].startswith("xAI "))
+        os.environ["OPENROUTER_API_KEY"] = "router-secret"
+        routed = investigate(world, "H-T001", transport=fail(400))
+        self.assertTrue(routed["reason"].startswith("OpenRouter "))
+        self.assertNotIn("router-secret", json.dumps(routed))
         self.assertEqual(client["deterministic"]["decision"], "SAME_ENTITY")
         self.assertFalse(client["overrides_decision"])
         self.assertNotIn("xai-secret", json.dumps(client))

@@ -399,7 +399,8 @@ PAGE = """<!DOCTYPE html>
   .count.cleared b { color: var(--cleared); }
   .count.same b { color: var(--same); }
   .count.review b { color: var(--review); }
-  main { display: grid; grid-template-columns: 320px 1fr; min-height: calc(100vh - 92px); }
+  main { display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: calc(100vh - 92px); min-width: 0; }
+  section { min-width: 0; }
   aside { border-right: 1px solid var(--line); padding: 14px; }
   input {
     width: 100%;
@@ -531,7 +532,7 @@ PAGE = """<!DOCTYPE html>
   .reason { margin: 8px 0 12px; }
   .notice { margin: 0; padding: 8px 28px; background: var(--review-bg); color: var(--review); }
   .mini.human { background: #fff; color: var(--ink); border: 1px solid var(--ink); }
-  .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
+  .table-scroll { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
   .evidence-label {
     font-family: ui-sans-serif, system-ui, sans-serif;
     font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
@@ -588,21 +589,23 @@ PAGE = """<!DOCTYPE html>
   .tick { color: var(--cleared); font-weight: 700; }
   .cross { color: var(--same); font-weight: 700; }
   .scorehead { font-family: ui-sans-serif, system-ui, sans-serif; }
-  table.score { width: 100%; border-collapse: collapse; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; background: #fff; }
+  table.score { width: max-content; min-width: 100%; border-collapse: collapse; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; background: #fff; }
   table.score th, table.score td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
   form.try label { display: block; margin: 10px 0 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
   form.try input, form.try select { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: 15px ui-sans-serif, system-ui, sans-serif; }
-  main.single { grid-template-columns: 1fr; }
+  main.single { grid-template-columns: minmax(0, 1fr); }
   @keyframes rise { to { opacity: 1; transform: none; } }
   .dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 8px 0 14px; }
   .dash .count { cursor: default; }
   .analyst { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .analyst label { display: block; margin: 10px 0 4px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+  .analyst input, .analyst textarea, .analyst select { display: block; width: 100%; }
   .analyst textarea { min-height: 72px; }
   .audit { margin: 8px 0; }
   .audit .card { margin-top: 6px; }
   @media (max-width: 800px) {
-    main { grid-template-columns: 1fr; }
+    main { grid-template-columns: minmax(0, 1fr); }
     aside { border-right: 0; border-bottom: 1px solid var(--line); }
     #list { max-height: 240px; }
     .compare, .vs, .pair { grid-template-columns: 1fr; }
@@ -663,6 +666,7 @@ let alertFilter = "ALL";
 let listFilter = "ALL";
 let listLimit = 120;
 let humanLatest = {};
+let logWarning = "";
 const HUMAN_LABELS = {
   CONFIRM_MATCH: "Human: confirmed",
   CLEAR_MATCH: "Human: cleared",
@@ -838,6 +842,9 @@ function applyLocation() {
     if (preset && !found) {
       notice.hidden = false;
       notice.textContent = "Alert " + preset + " not found.";
+    } else if (logWarning && notice) {
+      notice.hidden = false;
+      notice.textContent = logWarning;
     } else if (notice) {
       notice.hidden = true;
       notice.textContent = "";
@@ -1217,6 +1224,11 @@ function renderList() {
 function clearNotice() {
   const notice = document.getElementById("notice");
   if (!notice) return;
+  if (logWarning) {
+    notice.hidden = false;
+    notice.textContent = logWarning;
+    return;
+  }
   notice.hidden = true;
   notice.textContent = "";
 }
@@ -1226,12 +1238,13 @@ function refreshHumans() {
     humanLatest = {};
     (data.events || []).forEach(event => { humanLatest[event.hit_id] = event; });
     const unread = data.unreadable_lines || [];
+    logWarning = unread.length ? unread.length + " unreadable log lines preserved at line " + unread.join(", ") + "." : "";
+  }).catch(() => {
     const notice = document.getElementById("notice");
-    if (unread.length && notice && notice.hidden) {
-      notice.hidden = false;
-      notice.textContent = unread.length + " unreadable log lines preserved at line " + unread.join(", ") + ".";
-    }
-  }).catch(() => {});
+    if (!notice) return;
+    notice.hidden = false;
+    notice.textContent = "Analyst decisions could not be loaded.";
+  });
 }
 
 function latestHuman(alert) {
