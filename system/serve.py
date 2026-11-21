@@ -287,7 +287,11 @@ PAGE = """<!DOCTYPE html>
     align-items: center;
     background: #faf7f1;
   }
-  .brand { display: flex; gap: 14px; align-items: center; }
+  a.brand {
+    display: flex; gap: 14px; align-items: center;
+    color: inherit; text-decoration: none; cursor: pointer;
+  }
+  a.brand:hover h1 { text-decoration: underline; }
   .mark {
     width: 42px; height: 42px; border-radius: 12px;
     background: var(--ink); color: var(--paper);
@@ -472,13 +476,13 @@ PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div class="brand">
+  <a class="brand" id="home" href="/">
     <div class="mark">D</div>
     <div>
       <h1>Doppelgänger</h1>
       <p>Is this hit the customer, or just the same name?</p>
     </div>
-  </div>
+  </a>
   <div class="counts" id="counts"></div>
 </header>
 <div class="workload" id="workload"></div>
@@ -554,8 +558,67 @@ function el(tag, className, text) {
   return node;
 }
 
+let suppressHistory = false;
+
+function remember(query) {
+  if (suppressHistory) return;
+  const next = location.pathname + (query ? "?" + query : "") + location.hash;
+  const now = location.pathname + location.search + location.hash;
+  if (next === now) return;
+  history.pushState({doppel: query || ""}, "", next);
+}
+
+function homeAlert() {
+  return alerts.find(alert => alert.hits.some(hit => hit.decision === "SAME_ENTITY")) || alerts[0];
+}
+
+function goHome(fromPop) {
+  filter = "ALL";
+  alertFilter = "ALL";
+  const search = document.getElementById("q");
+  if (search) search.value = "";
+  document.querySelectorAll("#counts .count").forEach(node => {
+    node.classList.toggle("active", node.dataset.filter === "ALL");
+  });
+  document.querySelectorAll("#workload .count").forEach(node => node.classList.remove("active"));
+  current = null;
+  suppressHistory = true;
+  setMode("alerts");
+  const start = homeAlert();
+  if (start) show(start);
+  suppressHistory = false;
+  if (!fromPop) remember("");
+  window.scrollTo(0, 0);
+  const list = document.getElementById("list");
+  if (list) list.scrollTop = 0;
+}
+
+function applyLocation() {
+  const params = new URLSearchParams(location.search);
+  filter = "ALL";
+  alertFilter = "ALL";
+  const search = document.getElementById("q");
+  if (search) search.value = params.get("q") || "";
+  document.querySelectorAll("#counts .count, #workload .count").forEach(node => node.classList.remove("active"));
+  const allChip = document.querySelector('#counts .count[data-filter="ALL"]');
+  if (allChip) allChip.classList.add("active");
+  suppressHistory = true;
+  const view = params.get("view");
+  if (view === "screen" || view === "answers" || view === "try") {
+    setMode(view);
+  } else {
+    setMode("alerts");
+    const preset = params.get("alert");
+    const start = (preset && alerts.find(alert => alert.alert_id === preset)) || homeAlert();
+    if (start) show(start);
+  }
+  suppressHistory = false;
+  window.scrollTo(0, 0);
+}
+
 function show(alert) {
   current = alert.alert_id;
+  if (!suppressHistory) remember("alert=" + encodeURIComponent(alert.alert_id));
   const rows = visible();
   const index = rows.findIndex(item => item.alert_id === current);
   const pos = document.getElementById("pos");
@@ -723,6 +786,7 @@ function runHit(hitId, host) {
 }
 
 function setMode(mode) {
+  if (!suppressHistory && mode !== "alerts") remember("view=" + mode);
   document.getElementById("layout").classList.toggle("single", mode !== "alerts");
   document.getElementById("browser").style.display = mode === "alerts" ? "" : "none";
   ["alerts", "answers", "try", "screen"].forEach(name => {
@@ -936,6 +1000,7 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
   function chip(key, className, number, label) {
     const button = el("button", "count" + (className ? " " + className : "") + (filter === key ? " active" : ""));
     button.type = "button";
+    button.dataset.filter = key;
     button.append(el("b", null, String(number)));
     button.append(document.createTextNode(label));
     button.onclick = () => {
@@ -1005,14 +1070,12 @@ fetch("/api/bundle").then(r => r.json()).then(data => {
     if (event.key === "ArrowDown" || event.key === "ArrowRight") { event.preventDefault(); step(1); }
     if (event.key === "ArrowUp" || event.key === "ArrowLeft") { event.preventDefault(); step(-1); }
   });
-  const params = new URLSearchParams(location.search);
-  if (params.get("q")) document.getElementById("q").value = params.get("q");
-  renderList();
-  const preset = params.get("alert");
-  const start = (preset && alerts.find(alert => alert.alert_id === preset))
-    || alerts.find(alert => alert.hits.some(hit => hit.decision === "SAME_ENTITY"))
-    || alerts[0];
-  if (start) show(start);
+  document.getElementById("home").addEventListener("click", event => {
+    event.preventDefault();
+    goHome(false);
+  });
+  window.addEventListener("popstate", () => applyLocation());
+  applyLocation();
 });
 </script>
 </body>
