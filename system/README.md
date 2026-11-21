@@ -6,7 +6,25 @@ Is this hit the customer, or just the same name?
 
 `system/run <data folder> <output file>` reads that folder and writes one JSON line per hit. If you pass the Google Sheets workbook instead of a folder, it converts the workbook first (same result as `python3 system/convert_xlsx.py`). Nothing is random and no model is called, so five runs produce the same decisions and the same reason codes. A development run takes a few seconds and costs nothing.
 
-The development workbook contains 440 alerts and 819 hits. That is the figure on its Start here tab. The brief's "about 440 alerts with 820 hits" is that same set, rounded. `output/dev.jsonl` has exactly one line for each of the 819 hits.
+The development workbook contains 440 alerts and 819 hits. That is the figure on its Start here tab. The brief's "about 440 alerts with 820 hits" is that same set, rounded. `output/dev.jsonl` has exactly one line for each of the 819 hits. On that file the engine clears 465 hits, confirms 122, and leaves 232 for review.
+
+```mermaid
+flowchart TD
+  alert[Alert] --> link{Account, login, or email?}
+  link -->|yes| holders[Records on that link]
+  link -->|no| search[Records matching screened name, date, country, city]
+  holders --> person[One person: same phone and full date of birth, or same document number]
+  search --> person
+  person --> verified[Latest approved KYC check or onboarding note]
+  hit[Hit profile] --> facts[Names, dates, countries, dated reports]
+  facts --> notes[Birth date or age in the first paragraph]
+  notes --> web[Otherwise a search result about this listing and country]
+  verified --> compare{Contradiction, agreement, or neither?}
+  web --> compare
+  compare -->|contradiction| clear[DIFFERENT_ENTITY]
+  compare -->|name and date agree, nothing contradicts| same[SAME_ENTITY]
+  compare -->|otherwise| review[REVIEW]
+```
 
 ```
 alert
@@ -25,7 +43,7 @@ alert
                                   │
 hit                               │
   ├─ names and aliases            │
-  ├─ dates: the dob field, else an age in the first paragraph,
+  ├─ dates: the dob field, else "born on" or an age in the first paragraph,
   │         else a search result about this listing in a linked country
   ├─ countries on the profile
   └─ dated reports, and a date of death
@@ -44,6 +62,10 @@ A hit is cleared only when something cannot be true of both sides: the customer 
 A person is confirmed when the name and the date of birth agree and nothing contradicts them. A company is confirmed when the name and a country agree. If more than one person fits the alert, each is decided; if they disagree, the hit is `REVIEW` / `AMBIGUOUS_CUSTOMER_RECORD` and the customer id is `AMBIGUOUS`.
 
 The evidence list is only the records that decided the hit: the customer records, the identity check or note, and a search result when the date came from one. It is not everything the pipeline opened.
+
+## Determinism, model, and cost
+
+No model and no prompts. The rules are fixed code, so two runs write the same bytes. A development run takes about 4 seconds on this machine and costs nothing. An alert is cleared only when every hit is `DIFFERENT_ENTITY`. One `SAME_ENTITY` escalates the alert to compliance. Anything else still needs an analyst.
 
 ## The review page
 
